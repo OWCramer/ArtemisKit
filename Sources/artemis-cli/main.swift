@@ -187,7 +187,7 @@ case "snapshot":
             var guardCount = 0
             // ARTEMIS_UNTIL=<ms>: stop the clock there (to look at the middle of a video).
             let until = ProcessInfo.processInfo.environment["ARTEMIS_UNTIL"].flatMap(Double.init) ?? .infinity
-            loop: while guardCount < 100_000 {
+            loop: while guardCount < 2_000_000 {
                 guardCount += 1
                 if time >= until { break loop }
                 switch player.wait {
@@ -197,10 +197,20 @@ case "snapshot":
                 case .stop, .click:
                     player.update(time: time + 5000)
                     time += 5000
+                    // The update may have moved on by itself (skip, auto, timers).
+                    if player.wait != .stop, player.wait != .click { continue }
+                    // In skip mode taps answer [stop]s (choices, menus); clicks are skipped.
+                    if player.wait == .click, ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil {
+                        if ProcessInfo.processInfo.environment["ARTEMIS_SKIP_TRACE"] != nil { print("skip re-enabled at \(player.interpreter.location)") }
+                        player.setSkipMode(true)
+                        continue
+                    }
                     guard !taps.isEmpty else { break loop }
                     let tap = taps.removeFirst()
                     print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
                     if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
+                    // ARTEMIS_SKIP=1: skip mode after each tap (it stops at choices).
+                    if ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil { player.setSkipMode(true) }
                 case .video:
                     player.videoFinished()
                 case .videoLayer:
@@ -215,6 +225,7 @@ case "snapshot":
                 if player.failure != nil { break loop }
             }
             print("stopped: \(player.wait) at \(player.interpreter.location), t=\(Int(time)) ms")
+            if let failure = player.failure { print("FAILED: \(failure)") }
             print("message layer: \(player.messages.current)")
             for layer in player.messages.layers.values where !layer.text.isEmpty {
                 print("  ~\(layer.id)\(layer.pageHidden ? " (hidden)" : ""): \(layer.text.prefix(120).replacingOccurrences(of: "\n", with: " / "))")

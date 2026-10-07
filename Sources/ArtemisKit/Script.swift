@@ -176,8 +176,10 @@ enum ScriptParser {
                 pendingTagLine = lineNumber
                 continue
             }
+            // A trailing comment, like a trailing tag, keeps the lineend insert off.
+            let endsInComment = stripped.count < text.count
             parseLine(stripped, line: lineNumber, into: &commands, autoInsert: &autoInsert,
-                      lineTagPrefix: &lineTagPrefix, isContinuation: false)
+                      lineTagPrefix: &lineTagPrefix, isContinuation: false, endsInComment: endsInComment)
         }
         return commands
     }
@@ -185,7 +187,8 @@ enum ScriptParser {
     /// Parses one logical line (labels, line tags, or a mix of tags and prose).
     private static func parseLine(
         _ text: String, line: Int, into commands: inout [ScriptCommand],
-        autoInsert: inout [String: [ScriptCommand.Kind]], lineTagPrefix: inout Character?, isContinuation: Bool
+        autoInsert: inout [String: [ScriptCommand.Kind]], lineTagPrefix: inout Character?, isContinuation: Bool,
+        endsInComment: Bool = false
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("*") {
@@ -233,8 +236,11 @@ enum ScriptParser {
                 pieces.append(piece)
             }
         }
-        if hasText, let head = autoInsert["linehead"] { pieces = head + pieces }
-        if hasText, let end = autoInsert["lineend"] { pieces += end }
+        // The engine inserts these only next to prose: a line that starts with a tag gets no
+        // linehead, and one that ends with a tag or a comment gets no lineend
+        // (`Praise her[rt]` in a choice list stays one line).
+        if hasText, case .text = pieces.first, let head = autoInsert["linehead"] { pieces = head + pieces }
+        if hasText, !endsInComment, case .text = pieces.last, let end = autoInsert["lineend"] { pieces += end }
         commands += pieces.map { ScriptCommand(kind: $0, line: line) }
     }
 

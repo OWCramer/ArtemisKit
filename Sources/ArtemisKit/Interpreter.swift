@@ -490,8 +490,10 @@ public final class ArtemisInterpreter {
             }
         }
         if let handler = attributes["handler"], !handler.isEmpty {
+            // The handler tag sees every parameter of the event (lyevent.txt), file and
+            // label included: handler="jump" jumps to the event's own target.
             var handlerAttributes = attributes
-            for key in ["file", "label", "call", "handler", "penetration"] { handlerAttributes[key] = nil }
+            handlerAttributes["handler"] = nil
             try perform(ArtemisTag(name: handler, attributes: handlerAttributes, order: handlerAttributes.keys.sorted()))
         }
         state = .running

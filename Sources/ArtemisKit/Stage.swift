@@ -99,6 +99,10 @@ public struct ArtemisTween {
     /// 0 = once; otherwise repeats (-1 forever), alternating when yoyo.
     public let loop: Int
     public let yoyo: Bool
+    /// `file`/`label`/`handler` to run when it finishes (the tag's parameters, like lyevent).
+    public var completion: [String: String]?
+    /// `delete="1"`: remove the layer when it finishes.
+    public var deletesLayer = false
 
     func value(at time: Double) -> (value: Double, finished: Bool) {
         guard duration > 0 else { return (to, time >= start) }
@@ -314,8 +318,10 @@ public final class ArtemisStage {
         let delay = tag.number("delay")
         let loop = Int(tag.number("loop"))
         tweens.removeAll { $0.layer == id && $0.property == property }
-        let tween = ArtemisTween(layer: id, property: property, from: from, to: to, start: now + delay,
+        var tween = ArtemisTween(layer: id, property: property, from: from, to: to, start: now + delay,
                                  duration: duration, ease: tag["ease"] ?? "none", loop: loop, yoyo: tag["yoyo"] == "1")
+        if tag["file"] != nil || tag["label"] != nil || tag["handler"] != nil { tween.completion = tag.attributes }
+        tween.deletesLayer = tag["delete"] == "1"
         tweens.append(tween)
         layer.setProperty(property, from)
         return loop == 0 ? now + delay + duration : .infinity
@@ -346,13 +352,28 @@ public final class ArtemisStage {
         }
         if !tweens.isEmpty { tweenRevision += 1 }
         var remaining: [ArtemisTween] = []
+        var deleted: [String] = []
         for tween in tweens {
             guard let layer = layer(tween.layer) else { continue }
             let (value, finished) = tween.value(at: time)
             layer.setProperty(tween.property, value)
-            if !finished { remaining.append(tween) }
+            if !finished {
+                remaining.append(tween)
+            } else {
+                if tween.deletesLayer { deleted.append(tween.layer) }
+                if let completion = tween.completion { finishedHandlers.append(completion) }
+            }
         }
         tweens = remaining
+        deleted.forEach(deleteLayer)
+    }
+
+    /// Completion handlers of tweens that finished, for the player to run.
+    private var finishedHandlers: [[String: String]] = []
+
+    public func takeFinishedHandlers() -> [[String: String]] {
+        defer { finishedHandlers.removeAll() }
+        return finishedHandlers
     }
 
     // MARK: Presenting

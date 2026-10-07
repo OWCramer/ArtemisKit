@@ -168,6 +168,14 @@ public final class ArtemisPlayer: ArtemisHost {
     public func update(time: Double) {
         now = time
         stage.update(time: time)
+        // Tween completion handlers (a choice's time limit) run like layer events, once
+        // the script is waiting on buttons.
+        pendingTweenHandlers += stage.takeFinishedHandlers()
+        if wait == .stop, !pendingTweenHandlers.isEmpty {
+            let handler = pendingTweenHandlers.removeFirst()
+            wait = .none
+            fire(handler, interrupt: false)
+        }
         if wait != waitKind {
             if waitKind == .click { interpreter.callLuaEvent("onClickWaitOut") }
             if wait == .click { interpreter.callLuaEvent("onClickWaitIn") }
@@ -209,6 +217,7 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     private var waitKind: Wait = .none
+    private var pendingTweenHandlers: [[String: String]] = []
 
     /// A synced channel (the game's `g.syncse` list, voices) is still speaking.
     private var voicePlaying: Bool {
