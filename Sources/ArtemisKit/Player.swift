@@ -34,8 +34,12 @@ public final class ArtemisPlayer: ArtemisHost {
     public private(set) var now: Double = 0
     public private(set) var log: [String] = []
     public var onLog: ((String) -> Void)?
-    /// Text shown since the message window was last cleared.
-    public private(set) var messageText = ""
+    public let messages = ArtemisMessages()
+    public private(set) lazy var textRenderer = ArtemisTextRenderer { [fileSystem] path in try? fileSystem.data(path) }
+    /// Text of the current message layer (for logs).
+    public var messageText: String { messages.currentLayer.text }
+    /// Prose left over after an `@` click wait, shown when the reader taps.
+    private var pendingText: String?
     public private(set) var failure: String?
 
     public init(gameRoot: URL, patchRoot: URL? = nil) throws {
@@ -80,7 +84,10 @@ public final class ArtemisPlayer: ArtemisHost {
             runInterpreter()
         case .click:
             wait = .none
-            messageText = ""
+            if let rest = pendingText {
+                pendingText = nil
+                if case .wait = show(text: rest, interpreter: interpreter) { return }
+            }
             runInterpreter()
         case .stop:
             guard let (_, event) = stage.clickTarget(at: point) else { return }
@@ -133,8 +140,30 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     public func show(text: String, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
-        messageText += text
+        // `@` in prose waits for a click.
+        if let at = text.firstIndex(of: "@") {
+            messages.append(String(text[..<at]))
+            let rest = String(text[text.index(after: at)...])
+            pendingText = rest.isEmpty ? nil : rest
+            wait = .click
+            return .wait("click")
+        }
+        messages.append(text)
         return .done
+    }
+
+    /// The stage with message text on top (headless snapshots).
+    public func renderSnapshot(scale: Double = 1) -> CGImage? {
+        guard let base = stage.render(scale: scale) else { return nil }
+        let w = base.width, h = base.height
+        guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return base }
+        context.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
+        context.translateBy(x: 0, y: CGFloat(h))
+        context.scaleBy(x: scale, y: -scale)
+        for layer in messages.layers.values.sorted(by: { $0.id < $1.id }) { textRenderer.draw(layer, in: context) }
+        return context.makeImage()
     }
 
     public func perform(_ tag: ArtemisTag, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
@@ -170,10 +199,19 @@ public final class ArtemisPlayer: ArtemisHost {
             wait = .stop
             return .wait("stop")
         case "rp":
-            // New page: clear the text.
-            messageText = ""
+            messages.clear()
         case "rt":
-            messageText += "\n"
+            messages.append("\n")
+        case "chgmsg":
+            messages.change(to: tag["id"])
+        case "/chgmsg":
+            messages.change(to: nil)
+        case "font":
+            messages.setFont(tag)
+        case "fontdefault":
+            messages.setFont(tag, defaults: true)
+        case "print":
+            messages.append(tag["data"] ?? "")
         case "video":
             guard let file = tag["file"], let data = try? fileSystem.data(file) else { return .done }
             if let media, media.playVideo(data, fileExtension: (file as NSString).pathExtension, finished: { [weak self] in
@@ -190,6 +228,8 @@ public final class ArtemisPlayer: ArtemisHost {
         case "system:get_sound_info", "system:get_message_size", "system:get_backlog_size", "system:get_message_tags":
             interpreter.variables[tag["name"] ?? ""] = "0"
         default:
+            // Closing tags of block-style tags ([/font], [/voice], [/chgmsg]) end nothing here.
+            if tag.name.hasPrefix("/") { return .done }
             return Self.acceptedSilently.contains(tag.name) ? .done : .unhandled
         }
         return .done
@@ -202,14 +242,14 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// Tags that change nothing visible yet (input setup, backlog, fonts, ...).
     static let acceptedSilently: Set<String> = [
-        "font", "fontdefault", "chgmsg", "print", "caption", "ruby", "indent", "glyph", "rclick", "hide", "skip",
+        "caption", "ruby", "indent", "glyph", "rclick", "hide", "skip",
         "backlog", "autosave", "automode", "writebacklog", "delonpush", "setonpush", "delonclick", "setonclick",
         "setonrollover", "setondrag", "setondragout", "link", "linkenable", "linkdisable", "keyconfig", "mouse",
         "anime", "backloglayer", "takess", "savess", "scetween", "scein", "sceout", "tweenset", "alreadyread", "reset",
         "setonautomodein", "setonautomodeout", "setoncontrolskipin", "setoncontrolskipout", "setonsoundfinish",
         "delonsoundfinish", "dialog", "openbrowser", "save", "load", "file", "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "lydrag", "lyedit", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
-        "exec", "tag",
+        "exec", "tag", "prohibit",
     ]
 
     // MARK: Config

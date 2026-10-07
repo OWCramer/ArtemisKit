@@ -179,7 +179,7 @@ case "snapshot":
                 layer.children.forEach { dump($0, depth + 1) }
             }
             if ProcessInfo.processInfo.environment["ARTEMIS_TREE"] != nil { player.stage.root.children.forEach { dump($0, 0) } }
-            guard let image = player.stage.render() else { print("render failed"); return }
+            guard let image = player.renderSnapshot() else { print("render failed"); return }
             let destination = CGImageDestinationCreateWithURL(output as CFURL, "public.png" as CFString, 1, nil)!
             CGImageDestinationAddImage(destination, image, nil)
             CGImageDestinationFinalize(destination)

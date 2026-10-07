@@ -243,7 +243,16 @@ public final class ArtemisInterpreter {
         var attributes: [String: String] = [:]
         var order: [String] = []
         for (key, value) in raw {
-            let evaluated = value.hasPrefix("$") ? try expression(String(value.dropFirst())).text : value
+            let evaluated: String
+            if value.hasPrefix("$$") {
+                // Indirection: the expression names the variable to read.
+                let name = try expression(String(value.dropFirst(2))).text
+                evaluated = self.value(of: name) ?? "0"
+            } else if value.hasPrefix("$") {
+                evaluated = try expression(String(value.dropFirst())).text
+            } else {
+                evaluated = value
+            }
             if attributes[key] == nil { order.append(key) }
             attributes[key] = evaluated
         }
