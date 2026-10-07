@@ -337,6 +337,16 @@ public final class ArtemisTextRenderer {
         pass(attributes(spec, fill: color(spec.color), strokeWidth: nil, strokeColor: nil), offset: .zero)
     }
 
+    /// The laid-out size of a layer's text: widest line, total height (line pitch times
+    /// lines) and the last line's width (get_message_layer_width/height/line_width).
+    public func measure(_ layer: ArtemisMessages.Layer) -> (width: Double, height: Double, lastLineWidth: Double) {
+        guard !layer.text.isEmpty else { return (0, 0, 0) }
+        let lines = layout(layer.text, spec: layer.font, attributes: attributes(layer.font, fill: nil, strokeWidth: nil, strokeColor: nil))
+        let width = lines.map(\.width).max() ?? 0
+        let height = lines.last.map { $0.top + $0.pitch - layer.font.top } ?? 0
+        return (width, height, lines.last?.width ?? 0)
+    }
+
     /// Rectangles (stage pixels, top-left origin) covering the first `count` characters, for
     /// revealing text gradually with a mask over a fully drawn line.
     public func revealRects(for layer: ArtemisMessages.Layer, count: Int) -> [CGRect] {

@@ -23,6 +23,9 @@ typedef struct ArtemisLuaHost {
     void (*mouse_point)(void *context, double *x, double *y);
     /// e:setEventHandler{event = "function"}: "" clears.
     void (*set_event_handler)(void *context, const char *event, const char *function);
+    /// Everything else the `e` object asks the engine (see LUA_PRELUDE in artemis_lua.c):
+    /// `name` plus string arguments; returns a malloc'd answer, or NULL for nil.
+    char *(*query)(void *context, const char *name, int count, const char *const *args, size_t *length);
 } ArtemisLuaHost;
 
 /// A Lua 5.1 state with the standard libraries, `e`, and the archive-backed io.open.
@@ -47,3 +50,7 @@ int artemis_lua_has_function(lua_State *L, const char *function);
 /// -1 when there's none, 1 when it handled the tag (skip it), 0 to run the tag. On a Lua
 /// error, sets `*error` (malloc'd) and returns 0.
 int artemis_lua_filter_tag(lua_State *L, const char *name, int count, const char *const *keys, const char *const *values, char **error);
+
+/// Runs the function set by e:setEventFilter with (e, tagName, param): 0 continue,
+/// 1 handled, 2 failed; -1 when there's no filter. Errors set `*error` (malloc'd), return 0.
+int artemis_lua_filter_event(lua_State *L, const char *name, int count, const char *const *keys, const char *const *values, char **error);

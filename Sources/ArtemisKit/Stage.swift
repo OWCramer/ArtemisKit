@@ -5,7 +5,7 @@ import ImageIO
 /// One Artemis layer. Ids are dotted paths (`100.1.2` sits inside `100.1`, inside `100`);
 /// siblings draw in numeric id order. Positions are in stage pixels relative to the parent.
 public final class ArtemisLayer {
-    public let id: String
+    public internal(set) var id: String
     public var image: CGImage?
     /// ARGB fill for colour layers (`color="FF000000"`).
     public var color: UInt32?
@@ -208,6 +208,39 @@ public final class ArtemisStage {
         parent.children.removeAll { $0.id == id }
         tweens.removeAll { $0.layer == id || $0.layer.hasPrefix(id + ".") }
         for key in events.keys where key == id || key.hasPrefix(id + ".") { events[key] = nil }
+    }
+
+    /// `[lyrename id= to=]`: moves a layer (and its subtree, tweens and events) to a new id
+    /// without reloading it.
+    public func rename(_ id: String, to newID: String) {
+        guard !id.isEmpty, !newID.isEmpty, id != newID, let moving = layer(id) else { return }
+        let parentId = id.split(separator: ".").dropLast().joined(separator: ".")
+        layer(parentId)?.children.removeAll { $0 === moving }
+        deleteLayer(newID)
+        func retag(_ node: ArtemisLayer) {
+            node.id = newID + node.id.dropFirst(id.count)
+            node.children.forEach(retag)
+        }
+        retag(moving)
+        let newParentId = newID.split(separator: ".").dropLast().joined(separator: ".")
+        let parent = ensureLayer(newParentId)
+        parent.children.append(moving)
+        parent.children.sort(by: ArtemisLayer.drawsBefore)
+        func moved(_ key: String) -> String? {
+            key == id ? newID : key.hasPrefix(id + ".") ? newID + key.dropFirst(id.count) : nil
+        }
+        tweens = tweens.map { tween in
+            guard let key = moved(tween.layer) else { return tween }
+            var copy = ArtemisTween(layer: key, property: tween.property, from: tween.from, to: tween.to, start: tween.start,
+                                    duration: tween.duration, ease: tween.ease, loop: tween.loop, yoyo: tween.yoyo)
+            copy.completion = tween.completion
+            copy.deletesLayer = tween.deletesLayer
+            return copy
+        }
+        for key in events.keys {
+            if let target = moved(key) { events[target] = events.removeValue(forKey: key) }
+        }
+        videoLayers = Set(videoLayers.map { moved($0) ?? $0 })
     }
 
     /// `[lyc]`: (re)creates a layer's content from an image or a colour. Keeps children.

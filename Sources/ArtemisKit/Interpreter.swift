@@ -37,6 +37,13 @@ public protocol ArtemisHost: AnyObject {
     func perform(_ tag: ArtemisTag, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome
     func show(text: String, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome
     func log(_ message: String)
+    /// Engine state Lua asks for that only the host knows (time, input, wait status,
+    /// memory saves); nil answers nil.
+    func luaQuery(_ name: String, _ arguments: [String], interpreter: ArtemisInterpreter) -> String?
+}
+
+public extension ArtemisHost {
+    func luaQuery(_ name: String, _ arguments: [String], interpreter: ArtemisInterpreter) -> String? { nil }
 }
 
 public struct ArtemisScriptError: Error, CustomStringConvertible {
@@ -77,7 +84,7 @@ public final class ArtemisInterpreter {
     public private(set) var state: State = .running
     public var variables: [String: String] = [:]
     /// Tag name -> (file, label) for tags defined by `macroadd`.
-    public private(set) var macros: [String: (file: String, label: String)] = [:]
+    public internal(set) var macros: [String: (file: String, label: String)] = [:]
     /// Positional parameter names from tag.ini.
     public private(set) var tagParameters: [String: [String]] = [:]
 
@@ -103,6 +110,22 @@ public final class ArtemisInterpreter {
         if let lua { artemis_lua_close(lua) }
     }
 
+    /// `[reset]`: a fresh engine (new Lua state, no macros or variables) that keeps `g.`.
+    public func resetForReboot(keeping globals: [String: String]) {
+        let width = Int(variables["sc.width"] ?? "") ?? 1280, height = Int(variables["sc.height"] ?? "") ?? 720
+        if let lua { artemis_lua_close(lua) }
+        lua = nil
+        frames = []
+        macros = [:]
+        queuedTags = []
+        luaEventHandlers = [:]
+        variables = globals
+        variables["sc.width"] = String(width)
+        variables["sc.height"] = String(height)
+        variables["os.name"] = "iphone"
+        startLua(stageWidth: width, stageHeight: height)
+    }
+
     // MARK: - Running
 
     /// Starts at the top of a script (the game's BOOT script).
@@ -115,6 +138,7 @@ public final class ArtemisInterpreter {
     @discardableResult
     public func run(maxSteps: Int = .max) -> State {
         if case .waiting = state { state = .running }
+        runQueuedTags()
         var budget = maxSteps
         while case .running = state, budget > 0 {
             step()
@@ -258,6 +282,12 @@ public final class ArtemisInterpreter {
             do { try callLua(tag) } catch { host?.log("lua error (continuing) at \(location): \(error)") }
         case "macroadd":
             try addMacros(file: tag["file"] ?? "")
+        case "macrodel":
+            let file = (tag["file"] ?? "").lowercased()
+            macros = macros.filter { $0.value.file.lowercased() != file }
+        case "tag":
+            // [tag data="name,key,value,..."]: runs any tag; backslash escapes commas.
+            if let tag = Self.tag(fromData: tag["data"] ?? "") { try perform(tag) }
         case "debugprint", "debug", "debugreload":
             host?.log("debug: \(tag["data"] ?? tag.description)")
         case "exit":
@@ -418,7 +448,12 @@ public final class ArtemisInterpreter {
     }
 
     private func jump(file: String?, label: String?) throws {
-        let (script, index) = try target(file: file, label: label)
+        // A jump to a label the script doesn't define (shipped typos, e.g. Memory's Dogma's
+        // `selend52_end`) is reported and skipped, so the reader isn't stranded.
+        guard let (script, index) = try? target(file: file, label: label) else {
+            host?.log("jump to missing \(file ?? "") *\(label ?? "") at \(location); continuing")
+            return
+        }
         frames[frames.count - 1].script = script
         frames[frames.count - 1].pc = index
     }
@@ -737,6 +772,154 @@ public final class ArtemisInterpreter {
         }
     }
 
+    /// A tag from `name,key,value,...` (the `tag` tag, get_backlog_tags).
+    static func tag(fromData data: String) -> ArtemisTag? {
+        var fields: [String] = []
+        var current = ""
+        var escaped = false
+        for character in data {
+            if escaped {
+                current.append(character)
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "," {
+                fields.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        fields.append(current)
+        guard let name = fields.first?.trimmingCharacters(in: .whitespaces), !name.isEmpty else { return nil }
+        var attributes: [String: String] = [:], order: [String] = []
+        var i = 1
+        while i + 1 < fields.count {
+            attributes[fields[i]] = fields[i + 1]
+            order.append(fields[i])
+            i += 2
+        }
+        return ArtemisTag(name: name, attributes: attributes, order: order)
+    }
+
+    /// `name,key,value,...` for a tag, escaping commas and backslashes.
+    static func tagData(_ name: String, _ pairs: [(String, String)]) -> String {
+        func escape(_ text: String) -> String {
+            text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: ",", with: "\\,")
+        }
+        return ([escape(name)] + pairs.flatMap { [escape($0.0), escape($0.1)] }).joined(separator: ",")
+    }
+
+    // MARK: Lua queries
+
+    /// Tags queued by `e:enqueueTag`, run when the script next runs.
+    private var queuedTags: [ArtemisTag] = []
+
+    private func runQueuedTags() {
+        while !queuedTags.isEmpty, case .running = state {
+            let tag = queuedTags.removeFirst()
+            do { try perform(tag) } catch { host?.log("queued tag \(tag.name): \(error)") }
+        }
+    }
+
+    private static let unitSeparator = "\u{1F}", recordSeparator = "\u{1E}"
+
+    func luaQuery(_ name: String, _ arguments: [String]) -> String? {
+        let us = Self.unitSeparator, rs = Self.recordSeparator
+        switch name {
+        case "block":
+            // e:getScriptBlock{file=, index=}: command, line and parameters.
+            let file = arguments.first ?? ""
+            guard let script = file.isEmpty ? frames.last?.script : try? self.script(file),
+                  case let index = arguments.count > 1 ? Int(Double(arguments[1]) ?? -1) : 0,
+                  index >= 0, index < script.commands.count else { return nil }
+            let command = script.commands[index]
+            var fields: [String]
+            switch command.kind {
+            case let .tag(tagName, attributes):
+                fields = [tagName, String(command.line)] + attributes.flatMap { [$0.0, $0.1] }
+            case let .lineTag(tagName, values):
+                fields = [tagName, String(command.line)] + values.enumerated().flatMap { [String($0.offset), $0.element] }
+            case let .text(text):
+                fields = ["print", String(command.line), "data", text]
+            case let .label(label):
+                fields = ["label", String(command.line), "name", label]
+            case .lua:
+                fields = ["lua", String(command.line)]
+            }
+            return fields.joined(separator: us)
+        case "size":
+            let file = arguments.first ?? ""
+            guard let script = file.isEmpty ? frames.last?.script : try? self.script(file) else { return nil }
+            return String(script.commands.count)
+        case "setStack":
+            // e:setScriptStack: keep the frames that still match, outermost first.
+            let records = (arguments.first ?? "").components(separatedBy: rs).filter { !$0.isEmpty }
+            var rebuilt: [Frame] = []
+            for (depth, record) in records.enumerated() {
+                let parts = record.components(separatedBy: us)
+                guard parts.count == 2, let index = Double(parts[1]).map({ Int($0) }) else { continue }
+                if depth < frames.count, frames[depth].script.path == parts[0] {
+                    var frame = frames[depth]
+                    frame.pc = index
+                    rebuilt.append(frame)
+                } else if let script = try? script(parts[0]) {
+                    rebuilt.append(Frame(script: script, pc: index, locals: [:], isMacro: false))
+                }
+            }
+            if !rebuilt.isEmpty { frames = rebuilt }
+            return nil
+        case "enqueue":
+            let parts = (arguments.first ?? "").components(separatedBy: us)
+            guard let tagName = parts.first, !tagName.isEmpty else { return nil }
+            var attributes: [String: String] = [:], order: [String] = []
+            var i = 1
+            while i + 1 < parts.count {
+                attributes[parts[i]] = parts[i + 1]
+                order.append(parts[i])
+                i += 2
+            }
+            queuedTags.append(ArtemisTag(name: tagName, attributes: attributes, order: order))
+            return nil
+        case "exists":
+            return fileSystem.file(arguments.first ?? "") != nil ? "1" : "0"
+        case "magicPath":
+            fileSystem.setMagicPath(arguments.first ?? "", to: arguments.count > 1 ? arguments[1] : "")
+            return nil
+        default:
+            return host?.luaQuery(name, arguments, interpreter: self)
+        }
+    }
+
+    /// Runs the game's `e:setEventFilter` function before an event fires: false when the
+    /// filter swallowed it (returned 1 or 2).
+    func filterEvent(tagName: String, attributes: [String: String]) -> Bool {
+        guard let lua else { return true }
+        let encoding = fileSystem.encoding
+        let order = attributes.keys.sorted()
+        var keys: [UnsafeMutablePointer<CChar>?] = order.map { strdup(luaBytes($0, encoding)) } + [nil]
+        var values: [UnsafeMutablePointer<CChar>?] = order.map { strdup(luaBytes(attributes[$0] ?? "", encoding)) } + [nil]
+        defer {
+            keys.forEach { free($0) }
+            values.forEach { free($0) }
+        }
+        var error: UnsafeMutablePointer<CChar>?
+        let result = keys.withUnsafeMutableBufferPointer { keyBuffer in
+            values.withUnsafeMutableBufferPointer { valueBuffer in
+                keyBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: keyBuffer.count) { k in
+                    valueBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: valueBuffer.count) { v in
+                        artemis_lua_filter_event(lua, luaBytes(tagName, encoding), Int32(order.count), k, v, &error)
+                    }
+                }
+            }
+        }
+        if let error {
+            host?.log("lua event filter (continuing): \(luaString(error, encoding))")
+            free(error)
+        }
+        return result <= 0
+    }
+
     static func decodeCharacterReferences(_ text: String) -> String {
         var result = ""
         var rest = Substring(text)
@@ -816,6 +999,18 @@ public final class ArtemisInterpreter {
             let point = MainActor.assumeIsolated { interpreter.pointer }
             x?.pointee = point.x
             y?.pointee = point.y
+        }
+        luaHost.query = { context, name, count, args, length in
+            let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
+            let encoding = interpreter.fileSystem.encoding
+            let arguments = (0 ..< Int(count)).map { luaString(args![$0]!, encoding) }
+            let answer = MainActor.assumeIsolated { interpreter.luaQuery(String(cString: name!), arguments) }
+            guard let answer else { return nil }
+            let bytes = answer.data(using: encoding, allowLossyConversion: true) ?? Data(answer.utf8)
+            length?.pointee = bytes.count
+            let buffer = malloc(max(1, bytes.count))!.assumingMemoryBound(to: CChar.self)
+            bytes.withUnsafeBytes { buffer.update(from: $0.bindMemory(to: CChar.self).baseAddress!, count: bytes.count) }
+            return buffer
         }
         luaHost.set_event_handler = { context, event, function in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()

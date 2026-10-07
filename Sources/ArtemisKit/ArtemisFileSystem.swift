@@ -69,7 +69,28 @@ public final class ArtemisFileSystem: @unchecked Sendable {
     }
 
     public func file(_ path: String) -> File? {
-        files[path.replacingOccurrences(of: "\\", with: "/").lowercased()]
+        files[resolveMagic(path).replacingOccurrences(of: "\\", with: "/").lowercased()]
+    }
+
+    /// `e:setMagicPath{"bg", "background"}`: `:bg/x` reads `background/x`.
+    private var magicPaths: [String: String] = [:]
+    private let magicLock = NSLock()
+
+    public func setMagicPath(_ word: String, to path: String) {
+        magicLock.lock()
+        defer { magicLock.unlock() }
+        magicPaths[word] = path.isEmpty ? nil : path
+    }
+
+    func resolveMagic(_ path: String) -> String {
+        guard path.hasPrefix(":") else { return path }
+        let body = path.dropFirst()
+        let end = body.firstIndex(where: { $0 == "/" || $0 == "\\" }) ?? body.endIndex
+        magicLock.lock()
+        let target = magicPaths[String(body[..<end])]
+        magicLock.unlock()
+        guard let target else { return path }
+        return target + body[end...]
     }
 
     /// The file on disk, for loose and patch files (archived ones have none).

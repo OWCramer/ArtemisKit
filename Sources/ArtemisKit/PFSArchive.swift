@@ -92,6 +92,8 @@ public final class PFSArchive: @unchecked Sendable {
 
     /// The bytes of one file, decrypted.
     public func data(for entry: Entry) throws -> Data {
+        // Placeholder entries (`*.dummy`) are empty.
+        if entry.size == 0 { return Data() }
         lock.lock()
         defer { lock.unlock() }
         try handle.seek(toOffset: entry.offset)

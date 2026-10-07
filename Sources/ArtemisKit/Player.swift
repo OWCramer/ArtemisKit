@@ -16,6 +16,25 @@ public protocol ArtemisMediaDelegate: AnyObject {
     /// Plays a full-screen movie; call `finished` when it ends or is skipped. Returns false
     /// when it can't be played, and the script carries on.
     func playVideo(_ source: ArtemisVideoSource, finished: @escaping () -> Void) -> Bool
+    /// `[openbrowser]`, `e:callShellExecute`.
+    func openURL(_ url: URL)
+    /// `[vibrate]`.
+    func vibrate()
+    /// `e:writeClipboard`.
+    func copyToClipboard(_ text: String)
+    /// Playback state of the music (`id` nil) or an effect channel: playing, gain (0...1000)
+    /// and pan (-1000...1000), for `get_sound_info`.
+    func soundInfo(_ id: String?) -> (playing: Bool, gain: Double, pan: Double)?
+    /// Effect channel ids with a sound loaded.
+    var soundChannels: [String] { get }
+}
+
+public extension ArtemisMediaDelegate {
+    func openURL(_ url: URL) {}
+    func vibrate() {}
+    func copyToClipboard(_ text: String) {}
+    func soundInfo(_ id: String?) -> (playing: Bool, gain: Double, pan: Double)? { nil }
+    var soundChannels: [String] { [] }
 }
 
 /// Where a full-screen movie comes from: loose files are streamed from disk (they can be
@@ -133,16 +152,33 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// Where `[save]` files go (the game's saves folder in Shiori).
     public var savePath: URL?
-    public private(set) var autoMode = false
-    public private(set) var skipMode = false
+    public private(set) var autoMode = false {
+        didSet {
+            guard autoMode != oldValue else { return }
+            queueEngineEvent(autoMode ? "automodein" : "automodeout")
+            if let id = autoModeLayer { stage.layer(id)?.visible = autoMode }
+        }
+    }
+    public private(set) var skipMode = false {
+        didSet {
+            guard skipMode != oldValue else { return }
+            let kind = forceSkip ? "controlskip" : "commandskip"
+            queueEngineEvent(kind + (skipMode ? "in" : "out"))
+            if !skipMode { forceSkip = false }
+        }
+    }
+    /// Skip that ignores read state (the engine's "control skip", Ctrl on Windows).
+    public private(set) var forceSkip = false
 
     /// The engine's read-only system variables (Artemis spec, system_variables.txt).
     private func systemVariable(_ name: String) -> String? {
         switch name {
         case "s.current_message_layer": return messages.current
         case "s.status.automode": return autoMode ? "1" : "0"
-        case "s.status.commandskip", "s.status.controlskip": return skipMode ? "1" : "0"
-        case "s.status.alreadyread", "s.status.avoid": return "0"
+        case "s.status.commandskip": return skipMode && !forceSkip ? "1" : "0"
+        case "s.status.controlskip": return skipMode && forceSkip ? "1" : "0"
+        case "s.status.alreadyread": return currentTextRead ? "1" : "0"
+        case "s.status.avoid": return "0"
         case "s.status.screendirection", "s.status.screendirectionprevious": return "1"
         case "s.status.statusbar": return "0"
         case "s.savepath": return savePath?.path ?? "savedata"
@@ -165,17 +201,55 @@ public final class ArtemisPlayer: ArtemisHost {
     // MARK: Driving
 
     /// Advances the clock (ms): tweens move, timed waits end, the script continues.
+    // MARK: Input state for Lua (e:isDown, e:getTouchPoint, ...)
+
+    /// Frames since boot (`e:getFrameNumber`).
+    public private(set) var frameNumber = 0
+    /// Keys held now, and the edges of the frame being run (key ids as strings: 1 = tap
+    /// or left button, 2 = right button).
+    private var keysDown: Set<String> = []
+    private var pendingEdges: [String: Set<String>] = [:]
+    private var frameEdges: [String: Set<String>] = [:]
+    /// The finger on the stage, if any (id -> point).
+    private var touches: [Int: CGPoint] = [:]
+
+    private func noteKey(_ key: String, _ edge: String) {
+        pendingEdges[edge, default: []].insert(key)
+    }
+
+    /// A finger went down or up at a stage point (from the presenter).
+    public func touch(_ id: Int, at point: CGPoint?) {
+        if let point {
+            if touches[id] == nil { noteKey("1", "downEdge"); keysDown.insert("1") }
+            touches[id] = point
+            interpreter.pointer = point
+        } else {
+            touches[id] = nil
+            if touches.isEmpty {
+                keysDown.remove("1")
+                noteKey("1", "upEdge")
+            }
+        }
+    }
+
     public func update(time: Double) {
         now = time
+        frameNumber += 1
+        frameEdges = pendingEdges
+        pendingEdges = [:]
         stage.update(time: time)
         // Tween completion handlers (a choice's time limit) run like layer events, once
         // the script is waiting on buttons.
         pendingTweenHandlers += stage.takeFinishedHandlers()
         if wait == .stop, !pendingTweenHandlers.isEmpty {
             let handler = pendingTweenHandlers.removeFirst()
-            wait = .none
-            fire(handler, interrupt: false)
+            if interpreter.filterEvent(tagName: "lytween", attributes: handler) {
+                wait = .none
+                fire(handler, interrupt: false)
+            }
         }
+        watchFinishEvents()
+        runEngineEvents()
         if wait != waitKind {
             if waitKind == .click { interpreter.callLuaEvent("onClickWaitOut") }
             if wait == .click { interpreter.callLuaEvent("onClickWaitIn") }
@@ -193,6 +267,8 @@ public final class ArtemisPlayer: ArtemisHost {
                 runInterpreter()
             }
         case .click:
+            // Read skip stops at text not read before (unless the game allows unread skip).
+            if skipMode, !forceSkip, !skipUnread, alreadyReadEnabled, !currentTextRead { skipMode = false }
             let autoDelay = Double(interpreter.value(of: "s.automodewait") ?? "") ?? 2000
             if messages.isRevealing || (autoMode && voicePlaying) { waitStarted = time }
             if skipMode || (autoMode && !messages.isRevealing && time - waitStarted >= max(300, autoDelay)) {
@@ -209,8 +285,9 @@ public final class ArtemisPlayer: ArtemisHost {
                 runInterpreter()
             }
         case .stop:
-            // Skip ends where the reader has to choose.
+            // Skip ends where the reader has to choose; auto too when the game says so.
             if skipMode { skipMode = false }
+            if autoMode, autoStopByStop { autoMode = false }
         default:
             break
         }
@@ -230,12 +307,16 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// Toggles auto mode (text advances by itself after s.automodewait ms).
     public func setAutoMode(_ on: Bool) {
+        guard !on || autoAllowed else { return }
         autoMode = on
         if on { skipMode = false }
     }
 
-    /// Toggles skip mode (text and waits fly by until a choice or a tap).
-    public func setSkipMode(_ on: Bool) {
+    /// Toggles skip mode: text and waits fly by until a choice or a tap, and, unless the
+    /// game allows skipping unread text (or `force`), until text not read before.
+    public func setSkipMode(_ on: Bool, force: Bool = false) {
+        guard !on || skipAllowed else { return }
+        if on { forceSkip = force }
         skipMode = on
         if on { autoMode = false }
     }
@@ -263,7 +344,9 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     /// True while the reader has hidden the text.
-    public private(set) var hidden = false
+    public private(set) var hidden = false {
+        didSet { if hidden != oldValue { queueEngineEvent(hidden ? "hidein" : "hideout") } }
+    }
     private var hiddenLayers: [String] = []
     private var hideWindows: [String] = ["80", "81", "82", "90"]
     private var hideAllowed = true
@@ -271,10 +354,14 @@ public final class ArtemisPlayer: ArtemisHost {
     /// A tap at a stage point.
     public func tap(at point: CGPoint) {
         interpreter.pointer = point
+        noteKey("1", "decide")
         if hidden { unhide(); return }
-        if autoMode || skipMode {
-            autoMode = false
+        if skipMode {
             skipMode = false
+            return
+        }
+        if autoMode, autoStopByClick {
+            autoMode = false
             return
         }
         switch wait {
@@ -340,6 +427,7 @@ public final class ArtemisPlayer: ArtemisHost {
                 messages.revealAll()
                 return
             }
+            markRead()
             wait = .none
             if let rest = pendingText {
                 pendingText = nil
@@ -355,6 +443,9 @@ public final class ArtemisPlayer: ArtemisHost {
     /// or inside it, leaves. Ignored during transitions and movies, or when the game turned
     /// right-click off.
     public func rightClick() {
+        noteKey("2", "decide")
+        noteKey("2", "downEdge")
+        noteKey("2", "upEdge")
         // A key handler on the right button (key 2) takes precedence, e.g. menus bind it to
         // their *leave.
         if press(key: "2") { return }
@@ -377,7 +468,17 @@ public final class ArtemisPlayer: ArtemisHost {
     /// Runs a `[setonpush]` key handler, if one is set. Returns whether one ran.
     @discardableResult
     public func press(key: String) -> Bool {
-        guard var handler = keyHandlers[key] else { return false }
+        guard let handler = keyHandlers[key] else { return false }
+        noteKey(key, "decide")
+        return fireHandler(handler, tagName: "setonpush")
+    }
+
+    /// Runs a `setonpush`-style handler (keys, engine events): as an interrupt during text
+    /// and timed waits (returning to them when `call=1`), as a jump/call at a stop.
+    @discardableResult
+    private func fireHandler(_ attributes: [String: String], tagName: String) -> Bool {
+        var handler = attributes
+        guard interpreter.filterEvent(tagName: tagName, attributes: handler) else { return true }
         switch wait {
         case .click, .stop, .time:
             let interrupt = wait != .stop
@@ -449,6 +550,128 @@ public final class ArtemisPlayer: ArtemisHost {
         record(message)
     }
 
+    /// getScriptStatus numbers (e:getScriptStatus).
+    private var scriptStatus: Int {
+        if hidden { return 5 }
+        switch wait {
+        case .none: return 0
+        case .click: return 1
+        case let .time(_, skippable): return skippable ? 2 : 4
+        case .stop: return 3
+        case .video: return 7
+        case .dialog: return 9
+        case .sound, .videoLayer: return 1
+        }
+    }
+
+    public func luaQuery(_ name: String, _ arguments: [String], interpreter: ArtemisInterpreter) -> String? {
+        let us = "\u{1F}", rs = "\u{1E}"
+        let first = arguments.first ?? ""
+        switch name {
+        case "now":
+            return ArtemisValue.format(now.rounded())
+        case "frame":
+            return String(frameNumber)
+        case "status":
+            return String(scriptStatus)
+        case "setStatus":
+            // Only the documented safe use: stopped -> running.
+            if first == "0", wait == .stop || wait == .click {
+                wait = .none
+                pendingExec = { $0.runInterpreter() }
+            }
+            return nil
+        case "waitReason":
+            var fields: [String] = []
+            switch wait {
+            case let .time(until, _): fields += ["time", ArtemisValue.format(until.rounded())]
+            case .click where messages.isRevealing: fields += ["textTween", "1"]
+            case let .sound(id, _): fields += ["sound", id]
+            case let .videoLayer(id, _): fields += ["video", id]
+            default: break
+            }
+            return fields.joined(separator: us)
+        case "key":
+            let kind = first, key = arguments.count > 1 ? arguments[1] : ""
+            if let override = keyOverrides[key] ?? keyOverrides["*"] {
+                let bit = ["push": 1, "down": 2, "downEdge": 4, "upEdge": 8, "decide": 16][kind] ?? 0
+                return override & bit != 0 ? "1" : "0"
+            }
+            switch kind {
+            case "down": return keysDown.contains(key) ? "1" : "0"
+            case "push": return keysDown.contains(key) || frameEdges["downEdge"]?.contains(key) == true ? "1" : "0"
+            default:
+                // On touch screens a tap decides on release.
+                return frameEdges[kind]?.contains(key) == true ? "1" : "0"
+            }
+        case "overrideKey":
+            let key = first.isEmpty ? "*" : first
+            if arguments.count > 1, let status = Double(arguments[1]).map({ Int($0) }), status >= 0 {
+                keyOverrides[key] = status
+            } else {
+                keyOverrides[key] = nil
+            }
+            return nil
+        case "touchCount":
+            return String(touches.count)
+        case "touches":
+            return touches.map { "\($0.key)\(us)\(Int($0.value.x))\(us)\(Int($0.value.y))" }.joined(separator: rs)
+        case "saveToMemory":
+            let state = checkpoint ?? captureState(wait: savedWaits.first ?? wait)
+            return (try? JSONEncoder().encode(state)).flatMap { String(data: $0, encoding: .utf8) }
+        case "loadFromMemory":
+            if let data = first.data(using: .utf8), let state = try? JSONDecoder().decode(ArtemisSaveState.self, from: data) {
+                pendingExec = { player in
+                    if player.restore(state, transition: nil) { player.runInterpreter() }
+                }
+            }
+            return nil
+        case "pngComments":
+            let data = (try? fileSystem.data(first)) ?? (first.hasPrefix("/") ? FileManager.default.contents(atPath: first) : nil)
+                ?? FileManager.default.contents(atPath: resolveSavePath(first).path)
+            return data.map { Self.pngComments($0).flatMap { [$0.key, $0.value] }.joined(separator: us) }
+        case "bindSurface":
+            _ = stage.image(first)
+            return nil
+        case "touchHold":
+            return nil
+        case "clipboard":
+            media?.copyToClipboard(first)
+            return nil
+        case "openURL":
+            if let url = URL(string: first) { media?.openURL(url) }
+            return nil
+        default:
+            if reportedLuaQueries.insert(name).inserted { record("unsupported Lua query \(name)") }
+            return nil
+        }
+    }
+
+    /// e:overrideKey statuses by key id ("*" = every key).
+    private var keyOverrides: [String: Int] = [:]
+    private var reportedLuaQueries: Set<String> = []
+
+    /// tEXt chunks of a PNG (keyword -> text).
+    static func pngComments(_ data: Data) -> [String: String] {
+        var result: [String: String] = [:]
+        var offset = 8
+        let bytes = [UInt8](data)
+        while offset + 8 <= bytes.count {
+            let length = Int(bytes[offset]) << 24 | Int(bytes[offset + 1]) << 16 | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3])
+            let type = String(bytes: bytes[offset + 4 ..< offset + 8], encoding: .ascii) ?? ""
+            let start = offset + 8
+            guard start + length <= bytes.count else { break }
+            if type == "tEXt", let zero = bytes[start ..< start + length].firstIndex(of: 0) {
+                let key = String(decoding: bytes[start ..< zero], as: UTF8.self)
+                let value = String(decoding: bytes[(zero + 1) ..< (start + length)], as: UTF8.self)
+                result[key] = value
+            }
+            if type == "IEND" { break }
+            offset = start + length + 4
+        }
+        return result
+    }
+
     /// Backslash escapes in prose: `\;` `\@` `\ ` stand for the character itself (a leading
     /// `;` would be a comment, a bare `@` a click wait). `\@` becomes a placeholder so the
     /// click-wait split below leaves it alone.
@@ -470,6 +693,7 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     public func show(text raw: String, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
+        noteTextPosition()
         let text = Self.unescape(raw)
         // `@` in prose waits for a click.
         if let at = text.firstIndex(of: "@") {
@@ -546,6 +770,125 @@ public final class ArtemisPlayer: ArtemisHost {
             let time = tag.number("time")
             // input: 1 lets a tap end it; omitted/0 and 2 don't.
             if time > 0 { return waitTime(until: now + time, skippable: tag["input"] == "1") }
+        case "reset":
+            pendingExec = { $0.resetEngine() }
+            return .wait("reset")
+        case "file":
+            switch tag["command"] {
+            case "copy":
+                if let src = tag["src"], let dst = tag["dst"] {
+                    let data = (try? fileSystem.data(src)) ?? FileManager.default.contents(atPath: resolveSavePath(src).path)
+                    let target = resolveSavePath(dst)
+                    try? FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? data?.write(to: target, options: .atomic)
+                }
+            case "delete":
+                // Only inside the save folder: games delete their own temporary saves.
+                if let target = tag["target"] {
+                    let url = resolveSavePath(target).standardizedFileURL
+                    let root = resolveSavePath(".").standardizedFileURL.path
+                    if url.path.hasPrefix(root) { try? FileManager.default.removeItem(at: url) }
+                }
+            default:
+                break
+            }
+        case "setonclick", "setonrollover", "setonrollout", "setondrag", "setondragin", "setondragout":
+            // Older spellings of [lyevent mode=init type=...].
+            var attributes = tag.attributes
+            attributes["type"] = String(tag.name.dropFirst(5))
+            attributes["mode"] = "init"
+            stage.event(ArtemisTag(name: "lyevent", attributes: attributes, order: Array(attributes.keys)))
+        case "delonclick", "delonrollover", "delonrollout", "delondrag", "delondragin", "delondragout":
+            var attributes = tag.attributes
+            attributes["type"] = String(tag.name.dropFirst(5))
+            attributes["mode"] = "reset"
+            stage.event(ArtemisTag(name: "lyevent", attributes: attributes, order: Array(attributes.keys)))
+        case "setonautomodein", "setonautomodeout", "setoncommandskipin", "setoncommandskipout",
+             "setoncontrolskipin", "setoncontrolskipout", "setonhidein", "setonhideout", "setonbacklogin",
+             "setonbacklogout", "setondirchg", "setonwindowbutton":
+            engineHandlers[String(tag.name.dropFirst(5))] = tag.attributes
+        case "delonautomodein", "delonautomodeout", "deloncommandskipin", "deloncommandskipout",
+             "deloncontrolskipin", "deloncontrolskipout", "delonhidein", "delonhideout", "delonbacklogin",
+             "delonbacklogout", "delondirchg", "delonwindowbutton":
+            engineHandlers[String(tag.name.dropFirst(5))] = nil
+        case "setonsoundfinish":
+            engineHandlers["soundfinish:" + (tag["id"] ?? "")] = tag.attributes
+        case "delonsoundfinish":
+            engineHandlers["soundfinish:" + (tag["id"] ?? "")] = nil
+        case "setonvideofinish":
+            engineHandlers["videofinish:" + (tag["id"] ?? "")] = tag.attributes
+        case "delonvideofinish":
+            engineHandlers["videofinish:" + (tag["id"] ?? "")] = nil
+        case "lyrename":
+            if let id = tag["id"], let to = tag["to"] { stage.rename(id, to: to) }
+        case "alreadyread":
+            alreadyReadEnabled = tag["mode"] != "0"
+        case "writebacklog":
+            writeBacklog = tag["mode"] == "1"
+        case "backlog":
+            if let allow = tag["allow"] { backlogAllowed = allow != "0" }
+            if let includeFont = tag["includefont"] { backlogIncludesFont = includeFont != "0" }
+            if tag["clear"] == "1" { backlogPages.removeAll() }
+        case "backloglayer":
+            backlogLayer(tag)
+        case "openbrowser":
+            if let url = tag["url"].flatMap(URL.init(string:)) { media?.openURL(url) }
+        case "vibrate":
+            media?.vibrate()
+        case "callnative":
+            // Native plug-ins (a Windows Steam wrapper, say) don't exist here: answer empty.
+            if let result = tag["result"] { interpreter.variables[result] = "" }
+        case "httpget", "httppost":
+            // No network for game scripts: report a failed request.
+            if let result = tag["result"] ?? tag["name"] { interpreter.variables[result] = "" }
+            if let status = tag["status"] { interpreter.variables[status] = "0" }
+        case "purchase":
+            if let result = tag["result"] ?? tag["name"] { interpreter.variables[result] = "0" }
+        case "system:get_backlog_size":
+            interpreter.variables[tag["name"] ?? ""] = String(backlogPages.count)
+        case "system:get_backlog_tags":
+            let name = tag["name"] ?? ""
+            let index = Int(tag.number("page"))
+            let page = index >= 0 && index < backlogPages.count ? backlogPages[index] : []
+            let tags = tag["allfont"] == "1" ? page : page.filter { !$0.hasPrefix("font,") }
+            for (i, data) in tags.enumerated() { interpreter.variables["\(name).\(i)"] = data }
+            interpreter.variables["\(name).size"] = String(tags.count)
+        case "system:get_message_tags":
+            let name = tag["name"] ?? ""
+            let layer = tag["id"].map(messages.layer) ?? messages.currentLayer
+            let tags = pageTags(layer, includeFont: tag["allfont"] == "1")
+            for (i, data) in tags.enumerated() { interpreter.variables["\(name).\(i)"] = data }
+            interpreter.variables["\(name).size"] = String(tags.count)
+        case "system:get_message_layer_width":
+            interpreter.variables[tag["name"] ?? ""] = ArtemisValue.format(textRenderer.measure(messages.currentLayer).width.rounded())
+        case "system:get_message_layer_height":
+            interpreter.variables[tag["name"] ?? ""] = ArtemisValue.format(textRenderer.measure(messages.currentLayer).height.rounded())
+        case "system:get_message_layer_line_width":
+            interpreter.variables[tag["name"] ?? ""] = ArtemisValue.format(textRenderer.measure(messages.currentLayer).lastLineWidth.rounded())
+        case "system:get_message_layer_indent_nest":
+            interpreter.variables[tag["name"] ?? ""] = "0"
+        case "system:get_sound_info":
+            let name = tag["name"] ?? ""
+            func store(_ prefix: String, _ info: (playing: Bool, gain: Double, pan: Double)?) {
+                interpreter.variables[prefix + "playing"] = info?.playing == true ? "1" : "0"
+                if let info {
+                    interpreter.variables[prefix + "gain"] = ArtemisValue.format(info.gain.rounded())
+                    interpreter.variables[prefix + "pan"] = ArtemisValue.format(info.pan.rounded())
+                }
+            }
+            if let id = tag["id"] {
+                store(name + ".", media?.soundInfo(id))
+            } else {
+                store(name + ".", media?.soundInfo(nil))
+                let channels = media?.soundChannels ?? []
+                for (i, id) in channels.enumerated() {
+                    interpreter.variables["\(name).\(i).id"] = id
+                    store("\(name).\(i).", media?.soundInfo(id))
+                }
+                interpreter.variables["\(name).size"] = String(channels.count)
+            }
+        case "system:get_font":
+            interpreter.variables["\(tag["name"] ?? "").size"] = "0"
         case "setonpush":
             guard let key = tag["key"] else { break }
             var attributes = tag.attributes
@@ -591,6 +934,7 @@ public final class ArtemisPlayer: ArtemisHost {
             case "automode": setAutoMode(tag["mode"] != "0")
             case "skip": setSkipMode(tag["mode"].map { $0 != "0" } ?? !skipMode)
             case "hide": pendingExec = { $0.toggleHide() }
+            case "backlog": pendingExec = { $0.requestBacklog() }
             default: break
             }
         case "hide":
@@ -599,9 +943,19 @@ public final class ArtemisPlayer: ArtemisHost {
                 hideWindows = window.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             }
         case "automode":
-            if tag["allow"] == "0" { autoMode = false }
+            if let allow = tag["allow"] {
+                autoAllowed = allow != "0"
+                if !autoAllowed { autoMode = false }
+            }
+            if let layer = tag["layer"] { autoModeLayer = layer.isEmpty ? nil : layer } else if tag["allow"] != nil { autoModeLayer = nil }
+            if let value = tag["stopbyclick"] { autoStopByClick = value != "0" }
+            if let value = tag["stopbystop"] { autoStopByStop = value != "0" }
         case "skip":
-            if tag["allow"] == "0" { skipMode = false }
+            if let allow = tag["allow"] {
+                skipAllowed = allow != "0"
+                if !skipAllowed { skipMode = false }
+            }
+            if let unread = tag["unread"] { skipUnread = unread == "1" }
         case "rclick":
             if let allow = tag["allow"] { rightClickAllowed = allow != "0" }
             if let file = tag["file"], !file.isEmpty { rightClickFile = file }
@@ -610,6 +964,8 @@ public final class ArtemisPlayer: ArtemisHost {
             return .wait("stop")
         case "rp":
             recordHistory()
+            let store = tag["backlog"].map { $0 == "1" } ?? writeBacklog
+            if store { recordBacklogPage(messages.currentLayer) }
             messages.clear()
         case "rt":
             messages.append("\n")
@@ -656,9 +1012,12 @@ public final class ArtemisPlayer: ArtemisHost {
                 wait = .video
                 return .wait("video")
             }
-        case "splay", "sstop", "sfade", "seplay", "sestop", "sefade", "voice", "vstop":
-            if tag.name == "splay" { music = tag.attributes }
-            if tag.name == "sstop" { music = nil }
+        case "splay", "sstop", "sfade", "seplay", "sestop", "sefade", "voice", "vstop",
+             "sxfade", "span", "sepan", "sfadein", "sfadeout", "sefadein", "sefadeout":
+            // skippable=1 effects stay silent while skipping.
+            if tag.name == "seplay" || tag.name == "voice", tag["skippable"] == "1", skipMode { return .done }
+            if ["splay", "sxfade", "sfadein"].contains(tag.name) { music = tag.attributes }
+            if tag.name == "sstop" || tag.name == "sfadeout" { music = nil }
             media?.soundTag(tag) { [fileSystem] path in try? fileSystem.data(path) }
         case "system:get_layer_info":
             let name = tag["name"] ?? "li"
@@ -671,7 +1030,7 @@ public final class ArtemisPlayer: ArtemisHost {
             } else {
                 for (key, value) in stage.layerInfo(style: tag["style"]) { interpreter.variables["\(name).\(key)"] = value }
             }
-        case "system:get_sound_info", "system:get_message_size", "system:get_backlog_size", "system:get_message_tags":
+        case "system:get_message_size":
             interpreter.variables[tag["name"] ?? ""] = "0"
         default:
             // Closing tags of block-style tags ([/font], [/voice], [/chgmsg]) end nothing here.
@@ -689,14 +1048,244 @@ public final class ArtemisPlayer: ArtemisHost {
     /// Tags that change nothing visible yet (input setup, backlog, fonts, ...).
     static let acceptedSilently: Set<String> = [
         "caption", "ruby", "indent", "glyph",
-        "backlog", "autosave", "writebacklog", "delonclick", "setonclick",
-        "setonrollover", "setondrag", "setondragout", "link", "linkenable", "linkdisable", "keyconfig", "mouse",
-        "anime", "backloglayer", "tweenset", "alreadyread", "reset",
-        "setonautomodein", "setonautomodeout", "setoncontrolskipin", "setoncontrolskipout", "setonsoundfinish",
-        "delonsoundfinish", "openbrowser", "file", "btn_off", "info_hide_on", "info_hide_off",
+        "autosave", 
+        "link", "linkenable", "linkdisable", "keyconfig", "mouse",
+        "anime", "tweenset", 
+        
+        "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "lydrag", "lyedit", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
-        "tag", "prohibit",
+        "prohibit",
     ]
+
+    // MARK: Engine events (setonautomodein, setonsoundfinish, ...)
+
+    /// Handlers by event: automodein, commandskipout, hidein, backlogin, soundfinish:<id>,
+    /// videofinish:<id>, ...
+    private var engineHandlers: [String: [String: String]] = [:]
+    private var pendingEngineEvents: [String] = []
+    /// Sounds and video layers seen playing, to notice when they finish.
+    private var watchedPlaying: Set<String> = []
+
+    private func queueEngineEvent(_ name: String) {
+        if engineHandlers[name] != nil { pendingEngineEvents.append(name) }
+    }
+
+    private func runEngineEvents() {
+        while !pendingEngineEvents.isEmpty {
+            let name = pendingEngineEvents.removeFirst()
+            guard let handler = engineHandlers[name] else { continue }
+            let tagName = "seton" + (name.split(separator: ":").first.map(String.init) ?? name)
+            fireHandler(handler, tagName: tagName)
+        }
+    }
+
+    private func watchFinishEvents() {
+        for key in engineHandlers.keys {
+            let playing: Bool
+            if key.hasPrefix("soundfinish:") {
+                let id = String(key.dropFirst("soundfinish:".count))
+                playing = id.isEmpty ? (media?.soundInfo(nil)?.playing ?? false) : (media?.isSoundPlaying(id) ?? false)
+            } else if key.hasPrefix("videofinish:") {
+                playing = stage.isVideoPlaying(String(key.dropFirst("videofinish:".count)))
+            } else {
+                continue
+            }
+            if playing {
+                watchedPlaying.insert(key)
+            } else if watchedPlaying.remove(key) != nil {
+                pendingEngineEvents.append(key)
+            }
+        }
+    }
+
+    // MARK: Modes
+
+    private var autoAllowed = true
+    private var autoModeLayer: String?
+    private var autoStopByClick = true
+    private var autoStopByStop = true
+    private var skipAllowed = true
+    private var skipUnread = false
+
+    // MARK: Read text
+
+    private var alreadyReadEnabled = true
+    /// Script positions of text the reader has passed (kept with the globals).
+    private var readPositions: Set<String> = []
+    private var currentTextPosition: String?
+    /// Whether the text on screen had been read before (s.status.alreadyread).
+    private var currentTextRead = false
+
+    private func noteTextPosition() {
+        let position = interpreter.location
+        guard position != currentTextPosition else { return }
+        currentTextPosition = position
+        currentTextRead = readPositions.contains(position)
+    }
+
+    private func markRead() {
+        guard alreadyReadEnabled, let position = currentTextPosition else { return }
+        readPositions.insert(position)
+    }
+
+    // MARK: Built-in backlog
+
+    private var backlogAllowed = true
+    private var backlogIncludesFont = true
+    private var writeBacklog = true
+    /// Pages, oldest first, each a list of `tag`-tag data strings that redraw it.
+    private var backlogPages: [[String]] = []
+    private var backlogMargins = (top: 0.0, middle: 0.0, bottom: 0.0)
+
+    /// Tags that reproduce a message layer's page: its font, then the text line by line.
+    private func pageTags(_ layer: ArtemisMessages.Layer, includeFont: Bool) -> [String] {
+        let annotation = interpreter.value(of: "s.backlog.annotation") ?? ""
+        var tags: [String] = []
+        if includeFont {
+            let f = layer.font
+            var pairs: [(String, String)] = [("left", ArtemisValue.format(f.left)), ("top", ArtemisValue.format(f.top)),
+                                            ("width", ArtemisValue.format(f.width)), ("height", ArtemisValue.format(f.height)),
+                                            ("size", ArtemisValue.format(f.size)), ("color", String(format: "0x%06X", f.color)),
+                                            ("align", f.align), ("spacetop", ArtemisValue.format(f.spaceTop)),
+                                            ("spacemiddle", ArtemisValue.format(f.lineSpacing)),
+                                            ("spacebottom", ArtemisValue.format(f.spaceBottom)),
+                                            ("rubysize", ArtemisValue.format(f.rubySize)), ("kerning", ArtemisValue.format(f.kerning))]
+            if let face = f.face { pairs.insert(("face", face), at: 0) }
+            tags.append(ArtemisInterpreter.tagData("font", pairs))
+        }
+        let lines = layer.text.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() {
+            if !line.isEmpty {
+                var pairs = [("data", line)]
+                if !annotation.isEmpty { pairs.append(("annotation", annotation)) }
+                tags.append(ArtemisInterpreter.tagData("print", pairs))
+            }
+            if i < lines.count - 1 { tags.append("rt") }
+        }
+        return tags
+    }
+
+    private func recordBacklogPage(_ layer: ArtemisMessages.Layer) {
+        guard !layer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let page = pageTags(layer, includeFont: true)
+        guard backlogPages.last != page else { return }
+        backlogPages.append(page)
+        if backlogPages.count > 1000 { backlogPages.removeFirst(backlogPages.count - 1000) }
+        backlogFonts.append(layer.font)
+        backlogTexts.append(layer.text)
+        if backlogFonts.count > 1000 {
+            backlogFonts.removeFirst(backlogFonts.count - 1000)
+            backlogTexts.removeFirst(backlogTexts.count - 1000)
+        }
+    }
+
+    private var backlogFonts: [ArtemisMessages.Font] = []
+    private var backlogTexts: [String] = []
+    /// Height of the rendered backlog image (`backloglayer get_scroll_max`).
+    private var backlogImageHeight = 0.0
+
+    /// `[backloglayer]` (newer engines): renders every backlog page into a layer, newest at
+    /// the bottom of the screen; the game scrolls it by moving the layer's top.
+    private func backlogLayer(_ tag: ArtemisTag) {
+        if tag["set_margin_top"] != nil || tag["set_margin_middle"] != nil || tag["set_margin_bottom"] != nil {
+            backlogMargins = (tag.number("set_margin_top", default: backlogMargins.top),
+                              tag.number("set_margin_middle", default: backlogMargins.middle),
+                              tag.number("set_margin_bottom", default: backlogMargins.bottom))
+        }
+        if let name = tag["get_scroll_max"] {
+            interpreter.variables[name] = ArtemisValue.format(max(0, backlogImageHeight - stage.height).rounded())
+        }
+        if let bind = tag["bind"] {
+            if bind == "1", let id = tag["id"] {
+                boundBacklogLayer = id
+                renderBacklogLayer(id)
+            } else if let id = boundBacklogLayer {
+                stage.deleteLayer(id + ".~backlog")
+                boundBacklogLayer = nil
+            }
+        }
+    }
+
+    private var boundBacklogLayer: String?
+
+    private func renderBacklogLayer(_ id: String) {
+        var heights: [Double] = []
+        for (font, text) in zip(backlogFonts, backlogTexts) {
+            let page = ArtemisMessages.Layer(id: "backlog")
+            page.font = font
+            page.text = text
+            heights.append(textRenderer.measure(page).height)
+        }
+        let total = backlogMargins.top + heights.reduce(0, +)
+            + Double(max(0, heights.count - 1)) * backlogMargins.middle + backlogMargins.bottom
+        backlogImageHeight = max(total, 1)
+        let width = Int(stage.width), height = Int(backlogImageHeight.rounded(.up))
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        var y = backlogMargins.top
+        for ((font, text), pageHeight) in zip(zip(backlogFonts, backlogTexts), heights) {
+            let page = ArtemisMessages.Layer(id: "backlog")
+            page.font = font
+            page.font.top = y
+            page.text = text
+            textRenderer.draw(page, in: context)
+            y += pageHeight + backlogMargins.middle
+        }
+        let layer = stage.ensureLayer(id + ".~backlog")
+        layer.image = context.makeImage()
+        layer.width = Double(width)
+        layer.height = Double(height)
+        layer.left = 0
+        // Newest page at the bottom of the screen when the bound layer sits at top 0.
+        layer.top = stage.height - Double(height)
+        stage.present(transition: nil)
+    }
+
+    /// The reader asked for the backlog (Shiori's swipe, [exec command=backlog]): the game's
+    /// own backlog if it binds one to the wheel/arrow keys, else nil so the presenter shows
+    /// Shiori's.
+    @discardableResult
+    public func requestBacklog() -> Bool {
+        for key in ["136", "38", "40"] where keyHandlers[key] != nil {
+            if press(key: key) { return true }
+        }
+        queueEngineEvent("backlogin")
+        return false
+    }
+
+    // MARK: Reset
+
+    /// `[reset]`: the engine restarts from the boot script, keeping only `g.` variables.
+    private func resetEngine() {
+        saveGlobals()
+        let globals = interpreter.variables.filter { $0.key.hasPrefix("g.") }
+        stage.deleteLayer("")
+        stage.present(transition: nil)
+        messages.restore([], current: "default", stack: [], defaultFont: ArtemisMessages.Font())
+        media?.soundTag(ArtemisTag(name: "sstop", attributes: [:], order: [])) { _ in nil }
+        interpreter.resetForReboot(keeping: globals)
+        keyHandlers = [:]
+        engineHandlers = [:]
+        savedWaits = []
+        pendingText = nil
+        hidden = false
+        autoMode = false
+        skipMode = false
+        rightClickAllowed = true
+        rightClickFile = "rclick.iet"
+        wait = .none
+        do {
+            try interpreter.boot(Self.bootScript(fileSystem))
+        } catch {
+            failure = "reset: \(error)"
+            return
+        }
+        record("engine reset")
+        runInterpreter()
+    }
 
     // MARK: Saves
 
@@ -728,6 +1317,7 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     private func save(to file: String) {
+        interpreter.callLuaEvent("onSave")
         let state = checkpoint ?? captureState(wait: savedWaits.first ?? wait)
         let url = resolveSavePath(file)
         do {
@@ -747,6 +1337,13 @@ public final class ArtemisPlayer: ArtemisHost {
             record("load failed: no save at \(url.lastPathComponent)")
             return false
         }
+        guard restore(state, transition: transition) else { return false }
+        record("loaded \(url.lastPathComponent)")
+        return true
+    }
+
+    /// Puts a saved state back (a save file or e:loadFromMemory).
+    private func restore(_ state: ArtemisSaveState, transition: ArtemisTag?) -> Bool {
         do {
             try interpreter.restore(frames: state.frames)
         } catch {
@@ -779,13 +1376,17 @@ public final class ArtemisPlayer: ArtemisHost {
         case "stop": wait = .stop
         default: wait = .none
         }
-        record("loaded \(url.lastPathComponent)")
+        interpreter.callLuaEvent("onLoad")
         return true
     }
 
     private var globalsURL: URL { resolveSavePath("global.json") }
 
     private func loadGlobals() {
+        if let data = try? Data(contentsOf: resolveSavePath("read.json")),
+           let positions = try? JSONDecoder().decode([String].self, from: data) {
+            readPositions = Set(positions)
+        }
         guard let data = try? Data(contentsOf: globalsURL),
               let globals = try? JSONDecoder().decode([String: String].self, from: data) else { return }
         interpreter.variables.merge(globals) { _, saved in saved }
@@ -793,6 +1394,7 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// Writes `g.` variables (they live outside save slots). Call when leaving the game too.
     public func saveGlobals() {
+        try? JSONEncoder().encode(Array(readPositions).sorted()).write(to: resolveSavePath("read.json"), options: .atomic)
         let globals = interpreter.variables.filter { $0.key.hasPrefix("g.") }
         try? FileManager.default.createDirectory(at: globalsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? JSONEncoder().encode(globals).write(to: globalsURL, options: .atomic)

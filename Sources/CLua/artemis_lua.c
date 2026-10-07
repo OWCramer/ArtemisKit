@@ -213,6 +213,123 @@ static int e_file(lua_State *L) {
     return 1;
 }
 
+// __artemis_query(name, ...) -> string or nil: the generic channel the Lua prelude uses.
+static int artemis_query(lua_State *L) {
+    const ArtemisLuaHost *host = host_of(L);
+    const char *name = luaL_checkstring(L, 1);
+    int count = lua_gettop(L) - 1;
+    const char **args = malloc(sizeof(char *) * (count > 0 ? count : 1));
+    for (int i = 0; i < count; i++) {
+        // tostring copies for numbers and booleans live on the stack until we return.
+        if (lua_isboolean(L, i + 2)) {
+            args[i] = lua_toboolean(L, i + 2) ? "1" : "0";
+        } else {
+            args[i] = lua_tostring(L, i + 2);
+            if (!args[i]) args[i] = "";
+        }
+    }
+    size_t length = 0;
+    char *answer = host->query(host->context, name, count, args, &length);
+    free(args);
+    if (!answer) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, answer, length);
+    free(answer);
+    return 1;
+}
+
+// The rest of the engine API, in Lua over __artemis_query. Fields are joined with \31
+// (unit separator) and records with \30 (record separator).
+static const char *LUA_PRELUDE =
+    "local q = __artemis_query\n"
+    "__artemis_query = nil\n"
+    "local US, RS = string.char(31), string.char(30)\n"
+    "local function split(s, sep)\n"
+    "  local t = {}\n"
+    "  if s == nil or s == '' then return t end\n"
+    "  local start = 1\n"
+    "  while true do\n"
+    "    local i = string.find(s, sep, start, true)\n"
+    "    if not i then table.insert(t, string.sub(s, start)); break end\n"
+    "    table.insert(t, string.sub(s, start, i - 1)); start = i + 1\n"
+    "  end\n"
+    "  return t\n"
+    "end\n"
+    "local function pairsOf(record, from)\n"
+    "  local f, t = split(record, US), {}\n"
+    "  for i = from, #f - 1, 2 do t[f[i]] = f[i + 1] end\n"
+    "  return t\n"
+    "end\n"
+    "local function encodeTag(t)\n"
+    "  local parts = { tostring(t[1] or t[0] or '') }\n"
+    "  for k, v in pairs(t) do\n"
+    "    if type(k) == 'string' then table.insert(parts, k); table.insert(parts, tostring(v)) end\n"
+    "  end\n"
+    "  return table.concat(parts, US)\n"
+    "end\n"
+    "function e:now() return tonumber(q('now')) end\n"
+    "function e:getFrameNumber() return tonumber(q('frame')) end\n"
+    "function e:getScriptStatus() return tonumber(q('status')) end\n"
+    "function e:setScriptStatus(n) q('setStatus', n) end\n"
+    "function e:getScriptWaitReason()\n"
+    "  local t = pairsOf(q('waitReason') or '', 1)\n"
+    "  for k, v in pairs(t) do if k ~= 'sound' and k ~= 'video' then t[k] = tonumber(v) end end\n"
+    "  return t\n"
+    "end\n"
+    "function e:isDown(k) return q('key', 'down', k) == '1' end\n"
+    "function e:isDownEdge(k) return q('key', 'downEdge', k) == '1' end\n"
+    "function e:isUpEdge(k) return q('key', 'upEdge', k) == '1' end\n"
+    "function e:isPush(k) return q('key', 'push', k) == '1' end\n"
+    "function e:isDecide(k) return q('key', 'decide', k) == '1' end\n"
+    "function e:overrideKey(t) t = t or {}; q('overrideKey', t.key or '', t.status or '') end\n"
+    "function e:getTouchCount() return tonumber(q('touchCount')) or 0 end\n"
+    "function e:getTouchPoint()\n"
+    "  local t = {}\n"
+    "  for _, r in ipairs(split(q('touches') or '', RS)) do\n"
+    "    local f = split(r, US)\n"
+    "    t[tonumber(f[1])] = { x = tonumber(f[2]), y = tonumber(f[3]) }\n"
+    "  end\n"
+    "  return t\n"
+    "end\n"
+    "function e:getScriptBlock(t)\n"
+    "  t = t or {}\n"
+    "  local r = q('block', t.file or '', t.index or 0)\n"
+    "  if not r then return nil end\n"
+    "  local f = split(r, US)\n"
+    "  return { command = f[1], line = tonumber(f[2]), parameter = pairsOf(r, 3) }\n"
+    "end\n"
+    "function e:getScriptSize(file) return tonumber(q('size', file or '')) end\n"
+    "function e:setScriptStack(t)\n"
+    "  local records = {}\n"
+    "  local i = t[0] and 0 or 1\n"
+    "  while t[i] do table.insert(records, tostring(t[i].file) .. US .. tostring(t[i].index)); i = i + 1 end\n"
+    "  q('setStack', table.concat(records, RS))\n"
+    "end\n"
+    "function e:enqueueTag(t) q('enqueue', encodeTag(t)) end\n"
+    "function e:isFileExists(p) return q('exists', p) == '1' end\n"
+    "function e:convertEncoding(t) return t and t.source end\n"
+    "function e:saveToMemory() return q('saveToMemory') end\n"
+    "function e:loadFromMemory(s) q('loadFromMemory', s) end\n"
+    "function e:loadPngComments(p) return pairsOf(q('pngComments', p) or '', 1) end\n"
+    "function e:setMagicPath(t) q('magicPath', t[1] or '', t[2] or '') end\n"
+    "function e:bindSurface(p) q('bindSurface', p) end\n"
+    "function e:bindSurfaceAsync(p) q('bindSurface', p) end\n"
+    "function e:unbindSurface(p) q('unbindSurface', p) end\n"
+    "function e:isLoadingSurface(p) return false end\n"
+    "function e:clearSurfaceLoadQueue() end\n"
+    "function e:setEventFilter(f) __artemis_event_filter = f end\n"
+    "function e:setLogFilter(f) __artemis_log_filter = f end\n"
+    "function e:setUseMultiTouch(n) end\n"
+    "function e:setUseTouchHold(b) q('touchHold', b) end\n"
+    "function e:setFlickSensitivity(n) end\n"
+    "function e:setUseGlobalCapture(b) end\n"
+    "function e:writeClipboard(s) q('clipboard', s) end\n"
+    "function e:callShellExecute(t) if t and t.file then q('openURL', t.file) end return 0 end\n"
+    "function e:initNis(n) return true end\n"
+    ;
+
 // Methods Shiori doesn't implement yet: note the call, return nil.
 static int e_unsupported(lua_State *L) {
     const ArtemisLuaHost *host = host_of(L);
@@ -290,7 +407,7 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
         lua_setfield(L, -2, m->name);
     }
     static const char *unsupported[] = {
-        "getScriptBlock", "enqueueTag", NULL,
+        NULL,
     };
     for (const char **name = unsupported; *name; name++) {
         lua_pushstring(L, *name);
@@ -302,6 +419,14 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
     lua_pushcfunction(L, artemis_read);
     lua_setglobal(L, "__artemis_read");
     if (luaL_loadstring(L, IO_PRELUDE) == 0) lua_call(L, 0, 0);
+    lua_pushcfunction(L, artemis_query);
+    lua_setglobal(L, "__artemis_query");
+    if (luaL_loadstring(L, LUA_PRELUDE) == 0) {
+        lua_call(L, 0, 0);
+    } else {
+        host->debug(host->context, lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
     return L;
 }
 
@@ -396,4 +521,33 @@ int artemis_lua_filter_tag(lua_State *L, const char *name, int count, const char
     int skip = lua_isnumber(L, -1) && lua_tonumber(L, -1) == 1;
     lua_pop(L, 1);
     return skip;
+}
+
+int artemis_lua_filter_event(lua_State *L, const char *name, int count, const char *const *keys, const char *const *values, char **error) {
+    *error = NULL;
+    lua_getglobal(L, "__artemis_event_filter");
+    if (lua_isstring(L, -1) && !lua_isnumber(L, -1)) {
+        // A function name rather than the function itself.
+        const char *function = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        push_dotted(L, function);
+    }
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return -1;
+    }
+    lua_getglobal(L, "e");
+    lua_pushstring(L, name);
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        lua_pushstring(L, values[i]);
+        lua_setfield(L, -2, keys[i]);
+    }
+    if (lua_pcall(L, 3, 1, 0) != 0) {
+        *error = pop_error(L);
+        return 0;
+    }
+    int result = lua_isnumber(L, -1) ? (int)lua_tonumber(L, -1) : 0;
+    lua_pop(L, 1);
+    return result;
 }
