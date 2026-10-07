@@ -808,6 +808,17 @@ public final class ArtemisPlayer: ArtemisHost {
             if tag["sync"] == "1", end.isFinite { return waitTime(until: end, skippable: tag["input"] == "1") }
         case "lytweendel":
             stage.deleteTweens(tag)
+        case "tweenset":
+            stage.beginTweenSet(now: now)
+        case "/tweenset":
+            stage.endTweenSet()
+        case "anime":
+            stage.anime(tag, now: now)
+        case "lyedit":
+            stage.edit(tag)
+        case "lydrag":
+            // Start dragging this layer with the finger that's down (sliders jump to it).
+            if let id = tag["id"], !touches.isEmpty, let layer = stage.layer(id) { draggedLayer = layer }
         case "lyevent":
             stage.event(tag)
         case "lyevent_enable":
@@ -1144,15 +1155,14 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     /// Tags that change nothing visible yet (input setup, backlog, fonts, ...).
+    /// Tags with nothing to do here: Windows-only or legacy (mouse, keyconfig, ime, slider,
+    /// uidel, avoid, statusbar), line breaking CoreText already does (prohibit, wordparts,
+    /// indentmodify), and the window caption; plus common game macros' names.
     static let acceptedSilently: Set<String> = [
-        "caption", 
-        "autosave", 
-        "keyconfig", "mouse",
-        "anime", "tweenset", 
-        
+        "caption", "autosave", "keyconfig", "mouse", "prohibit", "wordparts", "indentmodify", "ime", "slider",
+        "uidel", "avoid", "statusbar",
         "btn_off", "info_hide_on", "info_hide_off",
-        "lyevent_delete", "lydrag", "lyedit", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
-        "prohibit",
+        "lyevent_delete", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
     ]
 
     // MARK: Click-wait glyph

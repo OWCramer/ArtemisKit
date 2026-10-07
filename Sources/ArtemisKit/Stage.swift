@@ -30,6 +30,8 @@ public final class ArtemisLayer {
     public var file: String?
     /// A video layer's decoder (`[video id=...]`); its frames become `image`.
     public var video: ArtemisVideo?
+    /// `[anime]` frames, when the layer is a flip-book.
+    public var anime: ArtemisAnime?
     /// `reversex` / `reversey`: mirrored around the anchor.
     public var reverseX = false
     public var reverseY = false
@@ -61,7 +63,7 @@ public final class ArtemisLayer {
     private var processed: CGImage?
     private var processedKey: String?
 
-    nonisolated(unsafe) private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     static func process(_ image: CGImage, negative: Bool, grayscale: Bool, multiply: UInt32, mask: CGImage?) -> CGImage? {
         var output = CIImage(cgImage: image)
@@ -88,6 +90,11 @@ public final class ArtemisLayer {
             ])
         }
         return ciContext.createCGImage(output.cropped(to: extent), from: extent)
+    }
+
+    static func filtered(_ image: CGImage, _ filter: (CIImage) -> CIImage) -> CGImage? {
+        let input = CIImage(cgImage: image)
+        return ciContext.createCGImage(filter(input).cropped(to: input.extent), from: input.extent)
     }
 
     /// Alpha (0...255) of the shown image at a point in layer pixels; 255 for colour layers.
@@ -171,40 +178,115 @@ public struct ArtemisTween {
     public let start: Double
     public let duration: Double
     public let ease: String
-    /// 0 = once; otherwise repeats (-1 forever), alternating when yoyo.
+    /// Plays: 0 once, N times, -1 forever (`loop`, or `yoyo` which swaps from/to on
+    /// every repeat).
     public let loop: Int
     public let yoyo: Bool
+    /// `loopdelay`: pause between repeats (ms).
+    public var loopDelay: Double = 0
     /// `file`/`label`/`handler` to run when it finishes (the tag's parameters, like lyevent).
     public var completion: [String: String]?
     /// `delete="1"`: remove the layer when it finishes.
     public var deletesLayer = false
+    /// Tweens of one `[tweenset]` share a group; removing one removes them all.
+    public var group: Int?
 
-    func value(at time: Double) -> (value: Double, finished: Bool) {
-        guard duration > 0 else { return (to, time >= start) }
-        var t = (time - start) / duration
-        if t < 0 { return (from, false) }
-        var finished = false
-        if loop == 0 {
-            if t >= 1 { t = 1; finished = true }
-        } else {
-            let cycle = floor(t)
-            if loop > 0, cycle >= Double(loop) { t = 1; finished = true } else {
-                t -= cycle
-                if yoyo, Int(cycle) % 2 == 1 { t = 1 - t }
-            }
-        }
-        if yoyo, loop == 0 { t = t < 0.5 ? t * 2 : (1 - t) * 2 }
-        return (from + (to - from) * ArtemisTween.eased(t, ease), finished)
+    /// Total plays, nil for forever.
+    var plays: Int? { loop < 0 ? nil : max(1, loop) }
+
+    /// The value at the end of the last play.
+    var endValue: Double {
+        guard yoyo, let plays else { return to }
+        return (plays - 1) % 2 == 1 ? from : to
     }
 
+    var endTime: Double {
+        guard let plays else { return .infinity }
+        return start + Double(plays) * duration + Double(plays - 1) * loopDelay
+    }
+
+    func value(at time: Double) -> (value: Double, finished: Bool) {
+        let elapsed = time - start
+        if elapsed < 0 { return (from, false) }
+        guard duration > 0 else { return (endValue, plays != nil) }
+        let cycleLength = duration + loopDelay
+        let cycle = Int(floor(elapsed / cycleLength))
+        if let plays, cycle >= plays { return (endValue, true) }
+        var t = min(1, (elapsed - Double(cycle) * cycleLength) / duration)
+        if let plays, cycle == plays - 1, t >= 1 { return (endValue, true) }
+        if yoyo, cycle % 2 == 1 { t = 1 - t }
+        return (from + (to - from) * ArtemisTween.eased(t, ease), false)
+    }
+
+    /// The engine's easing methods (lytween.txt; easings.net).
     static func eased(_ t: Double, _ ease: String) -> Double {
-        switch ease.lowercased() {
-        case "in", "easein", "in_quad", "quad_in": return t * t
-        case "out", "easeout", "out_quad", "quad_out": return t * (2 - t)
-        case "inout", "easeinout", "in_out", "inout_quad": return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t
+        let name = ease.lowercased()
+        let parts = name.split(separator: "_")
+        // Older spellings: in, out, inout.
+        let direction: String, curve: String
+        if parts.count == 2 {
+            direction = String(parts[0]).replacingOccurrences(of: "ease", with: "")
+            curve = String(parts[1])
+        } else {
+            switch name {
+            case "in", "easein": (direction, curve) = ("in", "quad")
+            case "out", "easeout": (direction, curve) = ("out", "quad")
+            case "inout", "easeinout": (direction, curve) = ("inout", "quad")
+            default: return t
+            }
+        }
+        func easeIn(_ x: Double) -> Double {
+            switch curve {
+            case "quad": return x * x
+            case "cubic": return x * x * x
+            case "quart": return x * x * x * x
+            case "quint": return x * x * x * x * x
+            case "expo": return x == 0 ? 0 : pow(2, 10 * x - 10)
+            case "circ": return 1 - (1 - x * x).squareRoot()
+            case "sine": return 1 - cos(x * .pi / 2)
+            case "back":
+                let c1 = 1.70158, c3 = c1 + 1
+                return c3 * x * x * x - c1 * x * x
+            case "elastic":
+                let c4 = 2 * Double.pi / 3
+                return x == 0 ? 0 : x == 1 ? 1 : -pow(2, 10 * x - 10) * sin((x * 10 - 10.75) * c4)
+            case "bounce":
+                return 1 - bounceOut(1 - x)
+            default: return x
+            }
+        }
+        func bounceOut(_ x: Double) -> Double {
+            let n1 = 7.5625, d1 = 2.75
+            if x < 1 / d1 { return n1 * x * x }
+            if x < 2 / d1 { let y = x - 1.5 / d1; return n1 * y * y + 0.75 }
+            if x < 2.5 / d1 { let y = x - 2.25 / d1; return n1 * y * y + 0.9375 }
+            let y = x - 2.625 / d1
+            return n1 * y * y + 0.984375
+        }
+        switch direction {
+        case "in": return easeIn(t)
+        case "out": return 1 - easeIn(1 - t)
+        case "inout": return t < 0.5 ? easeIn(2 * t) / 2 : 1 - easeIn(2 - 2 * t) / 2
         default: return t
         }
     }
+}
+
+/// `[anime]`: a flip-book on a layer, frames shown at times from its start.
+public struct ArtemisAnime {
+    public struct Frame {
+        public var time: Double
+        public var file: String
+        public var image: CGImage?
+        public var properties: [String: String]
+    }
+    public var frames: [Frame] = []
+    /// When the last frame ends (`mode=end time=`); nil while frames are still being added.
+    public var endTime: Double?
+    /// -1 forever, 0 once, N times.
+    public var loop = -1
+    public var started: Double = 0
+    public var shownFrame = -1
 }
 
 /// An input handler on a layer (`lyevent`).
@@ -328,7 +410,7 @@ public final class ArtemisStage {
         layer.image = nil; layer.color = nil; layer.file = nil; layer.video = nil
         layer.reverseX = false; layer.reverseY = false; layer.clip = nil; layer.blendMode = "normal"
         layer.negative = false; layer.grayscale = false; layer.colorMultiply = 0xFFFFFF; layer.mask = nil
-        layer.clickThreshold = nil; layer.draggable = false; layer.dragArea = nil
+        layer.clickThreshold = nil; layer.draggable = false; layer.dragArea = nil; layer.anime = nil
         if let mask = tag["mask"], !mask.isEmpty { layer.mask = image(mask) }
         tweens.removeAll { $0.layer == id }
         if let file = tag["file"], !file.isEmpty {
@@ -452,21 +534,54 @@ public final class ArtemisStage {
         let to = tag.number("to", default: from)
         let duration = tag.number("msec", default: tag.number("time"))
         let delay = tag.number("delay")
-        let loop = Int(tag.number("loop"))
-        tweens.removeAll { $0.layer == id && $0.property == property }
-        var tween = ArtemisTween(layer: id, property: property, from: from, to: to, start: now + delay,
-                                 duration: duration, ease: tag["ease"] ?? "none", loop: loop, yoyo: tag["yoyo"] == "1")
+        let yoyoCount = Int(tag.number("yoyo"))
+        let loop = yoyoCount != 0 ? yoyoCount : Int(tag.number("loop"))
+        // In a [tweenset], each tween starts when the one before it ends.
+        let start = (tweenSet.map { max($0.cursor, now) } ?? now) + delay
+        if tweenSet == nil { tweens.removeAll { $0.layer == id && $0.property == property } }
+        var tween = ArtemisTween(layer: id, property: property, from: from, to: to, start: start,
+                                 duration: duration, ease: tag["ease"] ?? "none", loop: loop, yoyo: yoyoCount != 0)
+        tween.loopDelay = tag.number("loopdelay")
         if tag["file"] != nil || tag["label"] != nil || tag["handler"] != nil { tween.completion = tag.attributes }
         tween.deletesLayer = tag["delete"] == "1"
+        if let set = tweenSet {
+            tween.group = set.group
+            tweenSet?.cursor = tween.endTime
+            if set.first { layer.setProperty(property, from) }
+            tweenSet?.first = false
+        } else {
+            layer.setProperty(property, from)
+        }
         tweens.append(tween)
-        layer.setProperty(property, from)
-        return loop == 0 ? now + delay + duration : .infinity
+        return tween.endTime
     }
 
+    /// `[tweenset]` ... `[/tweenset]` in progress.
+    private var tweenSet: (group: Int, cursor: Double, first: Bool)?
+    private var nextTweenGroup = 1
+
+    public func beginTweenSet(now: Double) {
+        tweenSet = (nextTweenGroup, now, true)
+        nextTweenGroup += 1
+    }
+
+    public func endTweenSet() {
+        tweenSet = nil
+    }
+
+    /// `[lytweendel]`: completes the layer's tweens (they land on their end values), and
+    /// the rest of any tween set they belong to.
     public func deleteTweens(_ tag: ArtemisTag) {
-        guard let id = tag["id"] else { tweens.removeAll(); return }
+        let id = tag["id"]
         let property = tag["param"]
-        tweens.removeAll { $0.layer == id && (property == nil || $0.property == property) }
+        let matching = tweens.filter { id == nil || ($0.layer == id && (property == nil || $0.property == property)) }
+        let groups = Set(matching.compactMap(\.group))
+        let done = tweens.filter { tween in matching.contains { $0.layer == tween.layer && $0.property == tween.property && $0.start == tween.start }
+            || (tween.group.map(groups.contains) ?? false) }
+        tweens.removeAll { tween in done.contains { $0.layer == tween.layer && $0.property == tween.property && $0.start == tween.start } }
+        // Last tween per property decides the value.
+        for tween in done.sorted(by: { $0.start < $1.start }) { layer(tween.layer)?.setProperty(tween.property, tween.endValue) }
+        tweenRevision += 1
     }
 
     /// Bumped whenever a tween moved or finished: animated layers show immediately (the
@@ -487,10 +602,16 @@ public final class ArtemisStage {
             }
         }
         if !tweens.isEmpty { tweenRevision += 1 }
+        updateAnime(time: time)
         var remaining: [ArtemisTween] = []
         var deleted: [String] = []
         for tween in tweens {
             guard let layer = layer(tween.layer) else { continue }
+            // A tween set's later tweens wait their turn without touching the layer.
+            if tween.group != nil, time < tween.start {
+                remaining.append(tween)
+                continue
+            }
             let (value, finished) = tween.value(at: time)
             layer.setProperty(tween.property, value)
             if !finished {
@@ -500,8 +621,120 @@ public final class ArtemisStage {
                 if let completion = tween.completion { finishedHandlers.append(completion) }
             }
         }
+        // A finished tween's set-mates go with it when its layer goes.
         tweens = remaining
         deleted.forEach(deleteLayer)
+    }
+
+    // MARK: Anime
+
+    /// `[anime id= mode=init|add|end ...]`.
+    public func anime(_ tag: ArtemisTag, now: Double) {
+        guard let id = tag["id"] else { return }
+        switch tag["mode"] ?? "init" {
+        case "init":
+            let layer = ensureLayer(id)
+            layer.left = 0; layer.top = 0; layer.alpha = 255; layer.xscale = 100; layer.yscale = 100
+            layer.rotate = 0; layer.visible = true; layer.color = nil
+            var anime = ArtemisAnime()
+            anime.loop = tag["loop"].flatMap { Int(ArtemisValue.number(from: $0) ?? -1) } ?? -1
+            anime.frames = [frame(tag, time: 0)]
+            layer.anime = anime
+            if let image = anime.frames[0].image {
+                layer.image = image
+                layer.file = anime.frames[0].file
+                layer.width = Double(image.width)
+                layer.height = Double(image.height)
+            }
+            if let mask = tag["mask"] { layer.mask = image(mask) }
+            animeLayers.insert(id)
+        case "add":
+            layer(id)?.anime?.frames.append(frame(tag, time: tag.number("time")))
+        case "end":
+            guard let layer = layer(id), var anime = layer.anime else { return }
+            anime.endTime = max(tag.number("time"), (anime.frames.last?.time ?? 0) + 1)
+            anime.started = now
+            layer.anime = anime
+        default:
+            break
+        }
+    }
+
+    private var animeLayers: Set<String> = []
+
+    private func frame(_ tag: ArtemisTag, time: Double) -> ArtemisAnime.Frame {
+        var properties = tag.attributes
+        for key in ["id", "mode", "file", "mask", "time", "loop"] { properties[key] = nil }
+        let file = tag["file"] ?? ""
+        return ArtemisAnime.Frame(time: time, file: file, image: file.isEmpty ? nil : image(file), properties: properties)
+    }
+
+    private func updateAnime(time: Double) {
+        for id in animeLayers {
+            guard let layer = layer(id), var anime = layer.anime else {
+                animeLayers.remove(id)
+                continue
+            }
+            guard let end = anime.endTime, end > 0 else { continue }
+            var elapsed = time - anime.started
+            let cycle = Int(floor(elapsed / end))
+            let plays = anime.loop < 0 ? Int.max : max(1, anime.loop)
+            if cycle >= plays { elapsed = end - 0.001 } else { elapsed -= Double(cycle) * end }
+            let index = anime.frames.lastIndex { $0.time <= elapsed } ?? 0
+            guard index != anime.shownFrame else { continue }
+            anime.shownFrame = index
+            layer.anime = anime
+            let frame = anime.frames[index]
+            if let image = frame.image {
+                layer.image = image
+                layer.file = frame.file
+            }
+            if !frame.properties.isEmpty {
+                apply(properties: ArtemisTag(name: "lyprop", attributes: frame.properties, order: Array(frame.properties.keys)), to: layer)
+            }
+            tweenRevision += 1
+        }
+    }
+
+    // MARK: lyedit
+
+    /// `[lyedit]`: bakes an effect into the layer's image.
+    public func edit(_ tag: ArtemisTag) {
+        guard let id = tag["id"], let layer = layer(id), let source = layer.image else { return }
+        let color = ArtemisMessages.rgb(tag["color"] ?? "FFFFFF")
+        let r = CGFloat((color >> 16) & 0xFF) / 255, g = CGFloat((color >> 8) & 0xFF) / 255, b = CGFloat(color & 0xFF) / 255
+        var output: CGImage?
+        switch tag["mode"] {
+        case "negative":
+            output = ArtemisLayer.process(source, negative: true, grayscale: false, multiply: 0xFFFFFF, mask: nil)
+        case "gray":
+            output = ArtemisLayer.process(source, negative: false, grayscale: true, multiply: 0xFFFFFF, mask: nil)
+        case "sepia":
+            output = ArtemisLayer.filtered(source) { $0.applyingFilter("CISepiaTone", parameters: [kCIInputIntensityKey: 1]) }
+        case "multiply":
+            output = ArtemisLayer.process(source, negative: false, grayscale: false, multiply: color & 0xFFFFFF, mask: nil)
+        case "add":
+            output = ArtemisLayer.filtered(source) {
+                $0.applyingFilter("CIColorMatrix", parameters: ["inputBiasVector": CIVector(x: r, y: g, z: b, w: 0)])
+            }
+        case "blend":
+            guard let file = tag["file"], let overlay = image(file) else { return }
+            let w = source.width, h = source.height
+            guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            context.draw(source, in: CGRect(x: 0, y: 0, width: w, height: h))
+            let left = tag.number("left"), top = tag.number("top")
+            context.draw(overlay, in: CGRect(x: left, y: Double(h) - top - Double(overlay.height),
+                                             width: Double(overlay.width), height: Double(overlay.height)))
+            output = context.makeImage()
+        default:
+            break
+        }
+        if let output {
+            layer.image = output
+            tweenRevision += 1
+        }
     }
 
     /// Completion handlers of tweens that finished, for the player to run.
