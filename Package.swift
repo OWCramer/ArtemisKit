@@ -9,7 +9,13 @@ let package = Package(
         .executable(name: "artemis-cli", targets: ["artemis-cli"]),
     ],
     targets: [
-        .target(name: "ArtemisKit", dependencies: ["CLua"]),
+        .target(name: "ArtemisKit", dependencies: ["CLua", "CVorbis"]),
+        // Ogg Vorbis decoding (stb_vorbis); see Sources/CVorbis/README.md.
+        .target(
+            name: "CVorbis",
+            exclude: ["README.md"],
+            cSettings: [.unsafeFlags(["-w"])]
+        ),
         // Lua 5.1.5 and Shiori's bridge for the engine's `e` object; see Sources/CLua/README.md.
         .target(
             name: "CLua",

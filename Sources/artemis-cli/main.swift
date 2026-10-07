@@ -134,6 +134,15 @@ case "run":
         let top = host.counts.sorted { $0.value > $1.value }.prefix(25).map { "\($0.key)×\($0.value)" }
         print("host tags: \(top.joined(separator: " "))")
     }
+case "decode":
+    // artemis-cli decode <game> <path>: decodes an Ogg Vorbis file from the game.
+    guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("no such file"); exit(1) }
+    let start = Date()
+    if let pcm = decodeOggVorbis(data) {
+        print("\(arguments[2]): \(pcm.channels) ch, \(pcm.sampleRate) Hz, \(pcm.frameCount) frames (\(String(format: "%.1f", Double(pcm.frameCount) / Double(pcm.sampleRate))) s), decoded in \(String(format: "%.2f", Date().timeIntervalSince(start))) s")
+    } else {
+        print("not Ogg Vorbis")
+    }
 case "snapshot":
     // artemis-cli snapshot <game> <out.png> [x,y ...]: runs on a simulated clock; each
     // [stop] takes the next tap (stage pixels); renders the stage when taps run out.
