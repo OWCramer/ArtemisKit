@@ -28,6 +28,9 @@ struct ArtemisSaveState: Codable {
         var text: String
         var visible: Bool
         var pageHidden: Bool
+        /// The page as styled runs (saves from before runs have text only).
+        var runs: [ArtemisMessages.Run]?
+        var links: [ArtemisMessages.Link]?
     }
 
     var version = 1
@@ -83,7 +86,8 @@ extension ArtemisStage {
 
 extension ArtemisMessages {
     func saved() -> ([ArtemisSaveState.Message], String, [String], Font) {
-        (layers.values.map { .init(id: $0.id, font: $0.font, text: $0.text, visible: $0.visible, pageHidden: $0.pageHidden) },
+        (layers.values.map { .init(id: $0.id, font: $0.font, text: $0.text, visible: $0.visible, pageHidden: $0.pageHidden,
+                                   runs: $0.runs, links: $0.links) },
          current, stackSnapshot, defaultFont)
     }
 
@@ -93,7 +97,8 @@ extension ArtemisMessages {
         for saved in messages {
             let layer = self.layer(saved.id)
             layer.font = saved.font
-            layer.text = saved.text
+            if let runs = saved.runs { layer.runs = runs } else { layer.text = saved.text }
+            layer.links = saved.links ?? []
             layer.visible = saved.visible
             layer.pageHidden = saved.pageHidden
             layer.revision += 1

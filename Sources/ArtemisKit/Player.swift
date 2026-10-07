@@ -82,7 +82,11 @@ public final class ArtemisPlayer: ArtemisHost {
     public private(set) var log: [String] = []
     public var onLog: ((String) -> Void)?
     public let messages = ArtemisMessages()
-    public private(set) lazy var textRenderer = ArtemisTextRenderer { [fileSystem] path in try? fileSystem.data(path) }
+    public private(set) lazy var textRenderer: ArtemisTextRenderer = {
+        let renderer = ArtemisTextRenderer { [fileSystem] path in try? fileSystem.data(path) }
+        renderer.indentPairs = { [weak self] in self?.messages.indentPairs ?? [:] }
+        return renderer
+    }()
     /// Text of the current message layer (for logs).
     public var messageText: String { messages.currentLayer.text }
     /// Prose left over after an `@` click wait, shown when the reader taps.
@@ -250,6 +254,7 @@ public final class ArtemisPlayer: ArtemisHost {
         }
         watchFinishEvents()
         runEngineEvents()
+        updateGlyph()
         if wait != waitKind {
             if waitKind == .click { interpreter.callLuaEvent("onClickWaitOut") }
             if wait == .click { interpreter.callLuaEvent("onClickWaitIn") }
@@ -364,6 +369,12 @@ public final class ArtemisPlayer: ArtemisHost {
             autoMode = false
             return
         }
+        if wait == .stop || wait == .click, let link = linkTarget(at: point) {
+            if wait == .click { markRead() }
+            wait = .none
+            fire(link, interrupt: false)
+            return
+        }
         switch wait {
         case .stop:
             guard let (_, event) = stage.clickTarget(at: point) else { return }
@@ -429,6 +440,12 @@ public final class ArtemisPlayer: ArtemisHost {
             }
             markRead()
             wait = .none
+            if overflowPageBreak {
+                overflowPageBreak = false
+                recordHistory()
+                if writeBacklog { recordBacklogPage(messages.currentLayer) }
+                messages.clear()
+            }
             if let rest = pendingText {
                 pendingText = nil
                 if case .wait = show(text: rest, interpreter: interpreter) { return }
@@ -696,16 +713,32 @@ public final class ArtemisPlayer: ArtemisHost {
         noteTextPosition()
         let text = Self.unescape(raw)
         // `@` in prose waits for a click.
+        var head = text, rest: String?
         if let at = text.firstIndex(of: "@") {
-            printProse(String(text[..<at]).replacingOccurrences(of: "\u{E000}", with: "@"))
-            let rest = String(text[text.index(after: at)...])
+            head = String(text[..<at])
+            rest = String(text[text.index(after: at)...])
+        }
+        printProse(head.replacingOccurrences(of: "\u{E000}", with: "@"))
+        // A page too long for its box waits for a click and continues on a new page.
+        let layer = messages.currentLayer
+        if let offset = textRenderer.overflowOffset(layer) {
+            let overflow = layer.truncate(atUTF16: offset).replacingOccurrences(of: "@", with: "\\@")
+            messages.touch(layer)
+            pendingText = overflow.trimmingCharacters(in: .newlines) + (rest.map { "@" + $0 } ?? "")
+            overflowPageBreak = true
+            wait = .click
+            return .wait("click")
+        }
+        if let rest {
             pendingText = rest.isEmpty ? nil : rest
             wait = .click
             return .wait("click")
         }
-        printProse(text.replacingOccurrences(of: "\u{E000}", with: "@"))
         return .done
     }
+
+    /// The click wait ends a page that overflowed: clear it before the rest.
+    private var overflowPageBreak = false
 
     /// Prose is a `print` to the engine, so the game's print tag filter (read-text colour,
     /// name substitution) sees each stretch between click waits first.
@@ -968,6 +1001,8 @@ public final class ArtemisPlayer: ArtemisHost {
             if store { recordBacklogPage(messages.currentLayer) }
             messages.clear()
         case "rt":
+            // omitblankline: no second newline in a row.
+            if tag["omitblankline"] == "1", messages.currentLayer.text.hasSuffix("\n") || messages.currentLayer.text.isEmpty { break }
             messages.append("\n")
         case "scetween":
             if tag["type"] == "in", tag["mode"] == "add", tag["param"] == "alpha" || tag["param"] == nil {
@@ -985,8 +1020,38 @@ public final class ArtemisPlayer: ArtemisHost {
             if traceMessages { record("/chgmsg -> \(messages.current) at \(interpreter.location)") }
         case "font":
             messages.setFont(tag)
+        case "/font":
+            messages.popFont()
+        case "fontinit":
+            messages.resetFont()
         case "fontdefault":
             messages.setFont(tag, defaults: true)
+        case "ruby":
+            messages.setRuby(tag["text"])
+        case "/ruby":
+            messages.setRuby(nil)
+        case "link":
+            messages.beginLink(tag.attributes)
+        case "/link":
+            messages.beginLink(nil)
+        case "linkenable":
+            messages.setLinksEnabled(true)
+        case "linkdisable":
+            messages.setLinksEnabled(false)
+        case "indent":
+            var pairs: [Character: Character] = [:]
+            let characters = Array(tag["pair"] ?? "")
+            var i = 0
+            while i + 1 < characters.count {
+                pairs[characters[i]] = characters[i + 1]
+                i += 2
+            }
+            messages.indentPairs = pairs
+            messages.indentNest = tag["nest"] == "1"
+        case "glyph":
+            glyph = (tag["layer"], tag["rplayer"], tag.number("left"), tag.number("top"),
+                     tag.number("rpleft"), tag.number("rptop"), tag["homing"] == "1")
+            updateGlyph()
         case "print":
             messages.append(Self.unescape(tag["data"] ?? "").replacingOccurrences(of: "\u{E000}", with: "@"))
         case "video":
@@ -1047,15 +1112,45 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// Tags that change nothing visible yet (input setup, backlog, fonts, ...).
     static let acceptedSilently: Set<String> = [
-        "caption", "ruby", "indent", "glyph",
+        "caption", 
         "autosave", 
-        "link", "linkenable", "linkdisable", "keyconfig", "mouse",
+        "keyconfig", "mouse",
         "anime", "tweenset", 
         
         "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "lydrag", "lyedit", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
         "prohibit",
     ]
+
+    // MARK: Click-wait glyph
+
+    /// `[glyph]`: line-end and page-end glyph layers, offsets, and whether they follow the text.
+    private var glyph: (layer: String?, pageLayer: String?, left: Double, top: Double, pageLeft: Double, pageTop: Double, homing: Bool)?
+
+    /// Shows the glyph at a click wait (at the end of the text when homing) and hides it
+    /// otherwise; the page-end glyph when the wait ends the page.
+    private func updateGlyph() {
+        guard let glyph else { return }
+        let atPageEnd = wait == .click && pendingText == nil && interpreter.nextTagName == "rp"
+        let active = (atPageEnd ? glyph.pageLayer : nil) ?? glyph.layer
+        for id in [glyph.layer, glyph.pageLayer].compactMap({ $0 }) {
+            stage.layer(id)?.visible = wait == .click && id == active
+        }
+        guard wait == .click, let id = active, glyph.homing, let layer = stage.layer(id),
+              let end = textRenderer.endPoint(messages.currentLayer) else { return }
+        layer.left = end.x + (atPageEnd ? glyph.pageLeft : glyph.left)
+        layer.top = end.y + (atPageEnd ? glyph.pageTop : glyph.top)
+    }
+
+    /// A tap on a `[link]` in the page on screen: its jump, like a button.
+    private func linkTarget(at point: CGPoint) -> [String: String]? {
+        for layer in messages.layers.values where layer.visible && !layer.pageHidden && !layer.links.isEmpty {
+            for (index, rect) in textRenderer.linkRects(layer) where rect.insetBy(dx: -6, dy: -4).contains(point) {
+                return layer.links[index].attributes
+            }
+        }
+        return nil
+    }
 
     // MARK: Engine events (setonautomodein, setonsoundfinish, ...)
 

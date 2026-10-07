@@ -154,6 +154,13 @@ public final class ArtemisInterpreter {
         return run()
     }
 
+    /// The tag the script runs next, if the next command is a tag (glyph placement).
+    public var nextTagName: String? {
+        guard let frame = frames.last, frame.pc < frame.script.commands.count else { return nil }
+        if case let .tag(name, _) = frame.script.commands[frame.pc].kind { return name }
+        return nil
+    }
+
     /// Where the script is, for logs and `e:getScriptStack()`.
     public var location: String {
         guard let frame = frames.last else { return "(finished)" }
