@@ -1,3 +1,4 @@
+import CryptoKit
 import CLua
 import CoreGraphics
 import Foundation
@@ -542,25 +543,47 @@ public final class ArtemisInterpreter {
     // MARK: Variables
 
     private func setVariable(_ tag: ArtemisTag) throws {
-        guard let name = tag["name"] else { return }
-        let value: String
-        if let system = tag["system"] {
+        guard let name = tag["name"] ?? (tag["system"] == "delete" ? "" : nil) else { return }
+        // `data` wins over `system` (var.txt). Functions that only act (delete) return nil.
+        let value: String?
+        if let data = tag["data"] {
+            value = data
+        } else if let system = tag["system"] {
             value = systemFunction(system, tag)
         } else {
-            value = tag["data"] ?? ""
+            value = ""
         }
-        if tag["local"] == "1", !frames.isEmpty {
+        guard let value else { return }
+        if (tag["writelocal"] == "1" || tag["local"] == "1"), !frames.isEmpty, tag["system"] != "var_exist" {
             frames[frames.count - 1].locals[name] = value
         } else {
             variables[name] = value
         }
     }
 
-    /// `[var system=...]` engine functions.
-    private func systemFunction(_ name: String, _ tag: ArtemisTag) -> String {
+    /// Bytes of `text` in the game's encoding (the engine's string positions are bytes).
+    private func byteCount(_ text: String) -> Int {
+        text.data(using: fileSystem.encoding, allowLossyConversion: true)?.count ?? text.utf8.count
+    }
+
+    /// Characters of `text` up to `bytes` bytes in the game's encoding.
+    private func characters(_ text: String, upToBytes bytes: Int) -> Int {
+        var total = 0, count = 0
+        for character in text {
+            total += byteCount(String(character))
+            if total > bytes { break }
+            count += 1
+        }
+        return count
+    }
+
+    /// `[var system=...]` engine functions. nil: the function doesn't store a value.
+    private func systemFunction(_ name: String, _ tag: ArtemisTag) -> String? {
+        let source = tag["source"] ?? ""
         switch name {
         case "var_exist":
-            let target = tag["target"] ?? tag["data"] ?? ""
+            let target = tag["target"] ?? ""
+            if tag["local"] == "1" { return frames.last?.locals[target] != nil ? "1" : "0" }
             return value(of: target) != nil ? "1" : "0"
         case "file_exist", "file_exists":
             var file = tag["file"] ?? ""
@@ -571,28 +594,108 @@ public final class ArtemisInterpreter {
         case "os":
             return "iphone"
         case "length":
-            return String((tag["source"] ?? tag["data"] ?? "").count)
+            // Bytes in the game's encoding; mode=1 counts characters.
+            return String(tag["mode"] == "1" ? source.count : byteCount(source))
         case "substr":
-            let source = Array(tag["source"] ?? tag["data"] ?? "")
-            let start = max(0, Int(tag.number("start")))
-            let length = Int(tag.number("length", default: Double(source.count)))
-            guard start < source.count else { return "" }
-            return String(source[start ..< min(source.count, start + max(0, length))])
+            let characters = Array(source)
+            var start = Int(tag.number("position", default: tag.number("start")))
+            var length = tag["length"].map { Int(ArtemisValue.number(from: $0) ?? 0) } ?? Int.max
+            if tag["mode"] != "1" {
+                // Byte positions: convert to characters.
+                let startCharacters = self.characters(source, upToBytes: max(0, start))
+                if length != Int.max {
+                    let rest = String(characters[min(characters.count, startCharacters)...])
+                    length = self.characters(rest, upToBytes: max(0, length))
+                }
+                start = startCharacters
+            }
+            start = max(0, start)
+            guard start < characters.count else { return "" }
+            let end = length == Int.max ? characters.count : min(characters.count, start + max(0, length))
+            return String(characters[start ..< end])
+        case "find":
+            // Byte position of `string` in `source`, -1 when absent.
+            guard let range = source.range(of: tag["string"] ?? "") else { return "-1" }
+            return String(byteCount(String(source[..<range.lowerBound])))
         case "explode":
-            // Splits `source` by `delimiter` into name.0, name.1, ... and name.size.
-            let source = tag["source"] ?? tag["data"] ?? ""
+            // Splits `source` by `delimiter` into name.0, name.1, ... and name.size;
+            // `escape` (default backslash) protects a delimiter.
             let delimiter = tag["delimiter"] ?? ","
-            let parts = delimiter.isEmpty ? source.map(String.init) : source.components(separatedBy: delimiter)
+            let escape = tag["escape"] ?? "\\"
+            var parts: [String] = []
+            if delimiter.isEmpty {
+                parts = source.map(String.init)
+            } else {
+                var current = ""
+                var rest = Substring(source)
+                while !rest.isEmpty {
+                    if !escape.isEmpty, rest.hasPrefix(escape + delimiter) {
+                        current += delimiter
+                        rest = rest.dropFirst(escape.count + delimiter.count)
+                    } else if rest.hasPrefix(delimiter) {
+                        parts.append(current)
+                        current = ""
+                        rest = rest.dropFirst(delimiter.count)
+                    } else {
+                        current.append(rest.removeFirst())
+                    }
+                }
+                parts.append(current)
+            }
             let base = tag["name"] ?? ""
             for (index, part) in parts.enumerated() { variables["\(base).\(index)"] = part }
             variables["\(base).size"] = String(parts.count)
-            return String(parts.count)
+            return nil
+        case "implode":
+            let base = tag["source"] ?? ""
+            let size = Int(value(of: base + ".size") ?? "") ?? 0
+            return (0 ..< size).map { value(of: "\(base).\($0)") ?? "" }.joined(separator: tag["delimiter"] ?? ",")
         case "delete":
-            let target = tag["target"] ?? tag["name"] ?? ""
-            variables[target] = nil
-            let prefix = target + "."
-            for key in variables.keys where key.hasPrefix(prefix) { variables[key] = nil }
-            return ""
+            // The variable itself first; when it doesn't exist, its children (delete.txt).
+            // No name: everything.
+            guard let target = tag["name"], !target.isEmpty else {
+                variables.removeAll()
+                return nil
+            }
+            if variables[target] != nil {
+                variables[target] = nil
+            } else {
+                let prefix = target + "."
+                for key in variables.keys where key.hasPrefix(prefix) { variables[key] = nil }
+            }
+            return nil
+        case "random":
+            let low = tag["min"].flatMap { ArtemisValue.number(from: $0) }.map { Int($0) } ?? 0
+            let high = tag["max"].flatMap { ArtemisValue.number(from: $0) }.map { Int($0) } ?? Int(Int32.max)
+            return String(Int.random(in: min(low, high) ... max(low, high)))
+        case "unixtime":
+            return String(Int(Date().timeIntervalSince1970))
+        case "base64_encode":
+            return (source.data(using: fileSystem.encoding, allowLossyConversion: true) ?? Data(source.utf8)).base64EncodedString()
+        case "url_encode":
+            return source.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? source
+        case "url_decode":
+            return source.replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? source
+        case "character_reference_to_utf8":
+            return Self.decodeCharacterReferences(source)
+        case "convert_encoding", "to_sjis", "to_utf8":
+            // Strings here are Unicode throughout; conversions are for byte-level tricks the
+            // engine needed on Windows.
+            return source
+        case "hmac_sha1_base64":
+            let key = SymmetricKey(data: Data((tag["key"] ?? "").utf8))
+            let mac = HMAC<Insecure.SHA1>.authenticationCode(for: Data((tag["message"] ?? "").utf8), using: key)
+            return Data(mac).base64EncodedString()
+        case "file_crc":
+            guard let data = try? fileSystem.data(tag["file"] ?? "") else { return "0" }
+            var text = String(Self.crc32(data), radix: 16)
+            text = String(repeating: "0", count: max(0, 8 - text.count)) + text
+            if tag["caps"] == "1" { text = text.uppercased() }
+            return (tag["zerox"] == "1" ? "0x" : "") + text
+        case "get_exe_parameter":
+            return nil
+        case "minimize":
+            return "0"
         case "screen_width":
             return variables["sc.width"] ?? "1280"
         case "screen_height":
@@ -624,13 +727,45 @@ public final class ArtemisInterpreter {
             return formatter.string(from: date)
         default:
             if let host, case .done = host.perform(ArtemisTag(name: "system:" + name, attributes: tag.attributes, order: tag.order), interpreter: self) {
-                return variables[tag["name"] ?? ""] ?? ""
+                // The host stores what it computes (pseudo-arrays, or `name` itself).
+                return nil
             }
             if reportedUnhandled.insert("system:" + name).inserted {
                 host?.log("unhandled var system=\(name) at \(location)")
             }
             return ""
         }
+    }
+
+    static func decodeCharacterReferences(_ text: String) -> String {
+        var result = ""
+        var rest = Substring(text)
+        while let start = rest.range(of: "&#") {
+            result += rest[..<start.lowerBound]
+            let after = rest[start.upperBound...]
+            guard let end = after.firstIndex(of: ";") else { result += rest[start.lowerBound...]; return result }
+            let body = after[..<end]
+            let scalar = body.first == "x" || body.first == "X" ? UInt32(body.dropFirst(), radix: 16) : UInt32(body)
+            if let scalar, let unicode = Unicode.Scalar(scalar) {
+                result.unicodeScalars.append(unicode)
+            } else {
+                result += rest[start.lowerBound ... end]
+            }
+            rest = after[after.index(after: end)...]
+        }
+        return result + rest
+    }
+
+    static func crc32(_ data: Data) -> UInt32 {
+        var table = [UInt32](repeating: 0, count: 256)
+        for i in 0 ..< 256 {
+            var c = UInt32(i)
+            for _ in 0 ..< 8 { c = c & 1 != 0 ? 0xEDB8_8320 ^ (c >> 1) : c >> 1 }
+            table[i] = c
+        }
+        var crc: UInt32 = 0xFFFF_FFFF
+        for byte in data { crc = table[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8) }
+        return crc ^ 0xFFFF_FFFF
     }
 
     // MARK: - Lua

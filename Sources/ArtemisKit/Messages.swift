@@ -53,8 +53,7 @@ public final class ArtemisMessages {
         }
 
         /// Height of one line: ruby band and gaps (font.txt) around the text row, which is
-        /// the font's own line height (ascent + descent + leading). Measured against the
-        /// PC build's screenshots: Memory's Dogma's baselines land where this puts them.
+        /// the font's own line height (see ArtemisTextRenderer.lineMetrics).
         func linePitch(textHeight: Double) -> Double {
             let pitch = spaceTop + rubySize + lineSpacing + textHeight + spaceBottom
             return pitch > 0 ? pitch : textHeight
@@ -244,6 +243,26 @@ public final class ArtemisTextRenderer {
         let width: Double
     }
 
+    /// The text row's ascent and height from the font's OS/2 typographic metrics (ascender,
+    /// descender, line gap), as the engine measures lines: Memory's Dogma's choice rows and
+    /// Ne no Kami's official screenshots both match these, not the hhea metrics CoreText
+    /// reports. Falls back to CoreText's metrics for fonts without an OS/2 table.
+    static func lineMetrics(_ font: CTFont, size: Double) -> (ascent: Double, height: Double) {
+        if let table = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?, table.count >= 74 {
+            func int16(_ offset: Int) -> Double {
+                Double(Int16(bitPattern: UInt16(table[table.startIndex + offset]) << 8 | UInt16(table[table.startIndex + offset + 1])))
+            }
+            let unitsPerEm = Double(CTFontGetUnitsPerEm(font))
+            let ascender = int16(68), descender = int16(70), lineGap = int16(72)
+            if unitsPerEm > 0, ascender > 0 {
+                let scale = size / unitsPerEm
+                return (ascender * scale, (ascender - descender + max(0, lineGap)) * scale)
+            }
+        }
+        let ascent = CTFontGetAscent(font)
+        return (ascent, ascent + CTFontGetDescent(font) + CTFontGetLeading(font))
+    }
+
     /// Lays text out the engine's way: wrapped to `width`, every line `linePitch` tall,
     /// glyphs under a ruby band, aligned left, centre or right.
     private func layout(_ text: String, spec: ArtemisMessages.Font, attributes: [NSAttributedString.Key: Any]) -> [Line] {
@@ -251,8 +270,7 @@ public final class ArtemisTextRenderer {
         let string = NSAttributedString(string: text, attributes: attributes)
         let typesetter = CTTypesetterCreateWithAttributedString(string)
         let length = (text as NSString).length
-        let ascent = CTFontGetAscent(ctFont)
-        let textHeight = ascent + CTFontGetDescent(ctFont) + CTFontGetLeading(ctFont)
+        let (ascent, textHeight) = Self.lineMetrics(ctFont, size: spec.size)
         let pitch = spec.linePitch(textHeight: textHeight)
         var lines: [Line] = []
         var start = 0
