@@ -25,6 +25,8 @@ public final class ArtemisVideo {
     public let audioSampleRate: Int
 
     private var decoder: Decoder
+    /// `foo_m.ogv` beside `foo.ogv`: a grayscale video whose brightness is the alpha.
+    public var mask: ArtemisVideo?
     /// Clock time of the first frame; set by the first update.
     private var startTime: Double?
     private var framesDecoded = 0
@@ -167,7 +169,32 @@ public final class ArtemisVideo {
             framesDecoded += 1
         }
         guard let planes else { return false }
+        // The mask follows frame for frame.
+        mask?.advance(toFrame: framesDecoded)
         return show(planes)
+    }
+
+    /// Mask videos: the luma of the current frame, kept for the colour video to use.
+    private var lumaFrame: (data: [UInt8], stride: Int)?
+
+    func advance(toFrame target: Int) {
+        var latest: ShioriPlanes?
+        while framesDecoded < target {
+            guard let next = decodeFrame() else {
+                if case let .theora(handle) = decoder {
+                    shiori_theora_rewind(handle)
+                    framesDecoded = 0
+                    continue
+                }
+                break
+            }
+            latest = next
+            framesDecoded += 1
+        }
+        if let latest {
+            let count = Int(latest.y_stride) * height
+            lumaFrame = (Array(UnsafeBufferPointer(start: latest.y, count: count)), Int(latest.y_stride))
+        }
     }
 
     private func decodeFrame() -> ShioriPlanes? {
@@ -200,10 +227,26 @@ public final class ArtemisVideo {
             return vImageConvert_420Yp8_Cb8_Cr8ToARGB8888(&y, &cb, &cr, &dest, &conversion, permute, 255,
                                                           vImage_Flags(kvImageNoFlags))
         }
-        guard converted == kvImageNoError, let provider = CGDataProvider(data: pixels as CFData) else { return false }
+        guard converted == kvImageNoError else { return false }
+        var alpha = CGImageAlphaInfo.noneSkipFirst
+        if let luma = mask?.lumaFrame, mask?.width == width, mask?.height == height {
+            // Alpha from the mask's brightness (full range), then premultiplied.
+            pixels.withUnsafeMutableBytes { out in
+                let bytes = out.bindMemory(to: UInt8.self)
+                for y in 0 ..< height {
+                    let row = y * bytesPerRow, maskRow = y * luma.stride
+                    for x in 0 ..< width { bytes[row + x * 4 + 3] = luma.data[maskRow + x] }
+                }
+                var buffer = vImage_Buffer(data: out.baseAddress, height: vImagePixelCount(height),
+                                           width: vImagePixelCount(width), rowBytes: bytesPerRow)
+                vImagePremultiplyData_RGBA8888(&buffer, &buffer, vImage_Flags(kvImageNoFlags))
+            }
+            alpha = .premultipliedFirst
+        }
+        guard let provider = CGDataProvider(data: pixels as CFData) else { return false }
         image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bytesPerRow,
                         space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+                        bitmapInfo: CGBitmapInfo(rawValue: alpha.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
                         provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
         return image != nil
     }

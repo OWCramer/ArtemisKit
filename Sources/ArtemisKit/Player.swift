@@ -152,6 +152,7 @@ public final class ArtemisPlayer: ArtemisHost {
         interpreter = ArtemisInterpreter(fileSystem: fs, stageWidth: width, stageHeight: height)
         interpreter.host = self
         interpreter.systemVariable = { [weak self] name in self?.systemVariable(name) }
+        stage.loadVideo = { [weak self] file, loop in self?.openVideoLayer(file, loop: loop) }
         stage.drawMessageLayer = { [weak self] id, context in
             guard let self, let layer = self.messages.layers[id] else { return }
             self.textRenderer.draw(layer, in: context)
@@ -450,6 +451,20 @@ public final class ArtemisPlayer: ArtemisHost {
         guard wait == .stop, let id = dragLayer, let event = stage.events[id]?[type], event.enabled else { return }
         wait = .none
         fire(event.attributes, interrupt: false)
+    }
+
+    /// A video layer's decoder, with its `_m` alpha video when the game has one.
+    func openVideoLayer(_ file: String, loop: Bool) -> ArtemisVideo? {
+        func open(_ path: String) -> ArtemisVideo? {
+            let ext = (path as NSString).pathExtension
+            return fileSystem.url(path).flatMap { ArtemisVideo(url: $0, loop: loop) }
+                ?? (try? fileSystem.data(path)).flatMap { $0.flatMap { ArtemisVideo(data: $0, fileExtension: ext, loop: loop) } }
+        }
+        guard let video = open(file) else { return nil }
+        let ext = (file as NSString).pathExtension
+        let maskPath = (file as NSString).deletingPathExtension + "_m" + (ext.isEmpty ? "" : "." + ext)
+        if fileSystem.file(maskPath) != nil { video.mask = open(maskPath) }
+        return video
     }
 
     /// Ends the current wait the way a plain tap does (advance text, skip a wait).
@@ -1121,10 +1136,7 @@ public final class ArtemisPlayer: ArtemisHost {
             let ext = (file as NSString).pathExtension
             if let id = tag["id"] {
                 // A video layer: decoded here, frames shown on the stage.
-                let loop = tag["loop"] == "1"
-                let video = fileSystem.url(file).flatMap { ArtemisVideo(url: $0, loop: loop) }
-                    ?? (try? fileSystem.data(file)).flatMap { $0.flatMap { ArtemisVideo(data: $0, fileExtension: ext, loop: loop) } }
-                guard let video else {
+                guard let video = openVideoLayer(file, loop: tag["loop"] == "1") else {
                     log("video layer \(file) can't be decoded; skipped")
                     return .done
                 }

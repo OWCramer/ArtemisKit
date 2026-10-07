@@ -387,6 +387,9 @@ public final class ArtemisStage {
         tweenRevision += 1
     }
 
+    /// Opens a video layer's file again (loading a save): path and loop.
+    public var loadVideo: ((String, Bool) -> ArtemisVideo?)?
+
     /// Draws a layered message layer's text (headless rendering).
     public var drawMessageLayer: ((String, CGContext) -> Void)?
 

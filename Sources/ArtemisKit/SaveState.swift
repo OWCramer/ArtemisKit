@@ -21,6 +21,9 @@ struct ArtemisSaveState: Codable {
         var anchorX, anchorY: Double?
         var visible: Bool
         var messageLayer: String?
+        /// A video layer's file and looping (it restarts on load).
+        var video: String?
+        var videoLoops: Bool?
     }
 
     struct Message: Codable {
@@ -61,7 +64,8 @@ extension ArtemisStage {
             result.append(.init(id: layer.id, file: layer.file, color: layer.color, width: layer.width, height: layer.height,
                                 left: layer.left, top: layer.top, alpha: layer.alpha, xscale: layer.xscale, yscale: layer.yscale,
                                 rotate: layer.rotate, anchorX: layer.anchorX, anchorY: layer.anchorY, visible: layer.visible,
-                                messageLayer: layer.messageLayer))
+                                messageLayer: layer.messageLayer,
+                                video: layer.video == nil ? nil : layer.file, videoLoops: layer.video?.loop))
             layer.children.forEach(visit)
         }
         root.children.forEach(visit)
@@ -72,8 +76,12 @@ extension ArtemisStage {
         deleteLayer("")
         for saved in layers {
             let layer = ensureLayer(saved.id)
+            // A video layer starts its video again; the saved properties go on top.
+            if let file = saved.video, let video = loadVideo?(file, saved.videoLoops ?? false) {
+                createVideo(id: saved.id, file: file, video: video)
+            }
             layer.file = saved.file
-            layer.image = saved.file.flatMap { file in
+            layer.image = saved.video != nil ? layer.image : saved.file.flatMap { file in
                 [file, file + ".png", file + ".jpg"].lazy.compactMap { self.image($0) }.first
             }
             layer.color = saved.color
