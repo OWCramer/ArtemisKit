@@ -1,15 +1,77 @@
 import ArtemisKit
+import CoreGraphics
 import Foundation
+import ImageIO
 
-// artemis-cli list <game folder>             every visible file, with its source
-// artemis-cli extract <game folder> <out> [prefix...]   writes files (all, or under prefixes)
-let arguments = CommandLine.arguments.dropFirst()
-guard let command = arguments.first, arguments.count >= 2 else {
-    print("usage: artemis-cli list|extract <game folder> [out] [prefix...]")
+// artemis-cli list <game folder>                     every visible file, with its source
+// artemis-cli extract <game folder> <out> [prefix...]  writes files (all, or under prefixes)
+// artemis-cli run <game folder> [waits] [steps]      boots the game headless and reports
+let arguments = Array(CommandLine.arguments.dropFirst())
+guard arguments.count >= 2 else {
+    print("usage: artemis-cli list|extract|run <game folder> ...")
     exit(2)
 }
-let game = URL(fileURLWithPath: arguments.dropFirst().first!)
+let command = arguments[0]
+let game = URL(fileURLWithPath: arguments[1])
 let fs = try ArtemisFileSystem(gameRoot: game)
+
+/// Presents nothing; logs what it's asked to do and resolves waits immediately.
+@MainActor
+final class HeadlessHost: ArtemisHost {
+    static let presentational: Set<String> = [
+        "lyc", "lyprop", "lydel", "lytween", "lytweendel", "lyevent", "lydrag", "lyedit", "trans", "flip",
+        "font", "fontdefault", "chgmsg", "rp", "rt", "print", "caption", "ruby", "indent", "glyph",
+        "rclick", "hide", "skip", "backlog", "autosave", "automode", "writebacklog", "delonpush", "setonpush",
+        "delonclick", "setonclick", "setonrollover", "setondrag", "setondragout", "link", "linkenable",
+        "linkdisable", "keyconfig", "mouse", "splay", "sstop", "sfade", "seplay", "sestop", "sefade", "voice",
+        "video", "anime", "backloglayer", "takess", "savess", "scetween", "scein", "sceout", "tweenset",
+        "alreadyread", "reset", "setonautomodein", "setonautomodeout", "setoncontrolskipin",
+        "setoncontrolskipout", "setonsoundfinish", "delonsoundfinish", "dialog", "openbrowser", "save",
+        "load", "file", "tag", "btn_off", "info_hide_on", "info_hide_off",
+    ]
+
+    var counts: [String: Int] = [:]
+    var unhandled: [String] = []
+    var texts: [String] = []
+    var logLines: [String] = []
+
+    func perform(_ tag: ArtemisTag, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
+        counts[tag.name, default: 0] += 1
+        switch tag.name {
+        case "wait":
+            return .wait("wait \(tag["time"] ?? "")")
+        case "stop":
+            return .wait("stop")
+        default:
+            return Self.presentational.contains(tag.name) ? .done : .unhandled
+        }
+    }
+
+    func show(text: String, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
+        texts.append(text)
+        return .done
+    }
+
+    func log(_ message: String) {
+        logLines.append(message)
+        if !message.hasPrefix("debug:") && !message.hasPrefix("lua:") { print("· \(message)") }
+    }
+}
+
+/// The BOOT script from system.ini ([IOS], else [WINDOWS]), defaulting to system/first.iet.
+func bootScript() -> String {
+    guard let data = try? fs.data("system.ini") else { return "system/first.iet" }
+    var section = ""
+    var boots: [String: String] = [:]
+    for raw in decodeScriptText(data).split(whereSeparator: \.isNewline) {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") { section = line; continue }
+        if line.uppercased().hasPrefix("BOOT"), let eq = line.firstIndex(of: "=") {
+            boots[section] = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        }
+    }
+    return boots["[IOS]"] ?? boots["[WINDOWS]"] ?? "system/first.iet"
+}
 
 switch command {
 case "list":
@@ -27,8 +89,8 @@ case "list":
     }
 case "extract":
     guard arguments.count >= 3 else { print("extract needs an output folder"); exit(2) }
-    let out = URL(fileURLWithPath: Array(arguments)[2])
-    let prefixes = Array(arguments.dropFirst(3)).map { $0.lowercased() }
+    let out = URL(fileURLWithPath: arguments[2])
+    let prefixes = arguments.dropFirst(3).map { $0.lowercased() }
     var count = 0
     for file in fs.files.values where prefixes.isEmpty || prefixes.contains(where: { file.path.lowercased().hasPrefix($0) }) {
         let target = out.appendingPathComponent(file.path)
@@ -37,6 +99,95 @@ case "extract":
         count += 1
     }
     print("extracted \(count) files to \(out.path)")
+case "run":
+    let maxWaits = arguments.count > 2 ? Int(arguments[2]) ?? 50 : 50
+    let maxSteps = arguments.count > 3 ? Int(arguments[3]) ?? 2_000_000 : 2_000_000
+    MainActor.assumeIsolated {
+        let host = HeadlessHost()
+        let interpreter = ArtemisInterpreter(fileSystem: fs, stageWidth: 1280, stageHeight: 720)
+        interpreter.host = host
+        let boot = bootScript()
+        print("boot \(boot)")
+        do { try interpreter.boot(boot) } catch { print("boot failed: \(error)"); return }
+        var waits = 0
+        loop: while true {
+            let state = interpreter.run(maxSteps: maxSteps)
+            switch state {
+            case let .waiting(reason):
+                waits += 1
+                if waits <= 40 || waits % 50 == 0 { print("wait #\(waits) \(reason) at \(interpreter.location)") }
+                if waits >= maxWaits { break loop }
+            case .finished:
+                print("finished")
+                break loop
+            case let .failed(message):
+                print("FAILED: \(message)")
+                break loop
+            case .running:
+                print("step budget used up at \(interpreter.location)")
+                break loop
+            }
+        }
+        print("steps: \(interpreter.steps), variables: \(interpreter.variables.count), macros: \(interpreter.macros.count)")
+        print("text lines shown: \(host.texts.count)")
+        for text in host.texts.prefix(8) { print("  » \(text)") }
+        let top = host.counts.sorted { $0.value > $1.value }.prefix(25).map { "\($0.key)×\($0.value)" }
+        print("host tags: \(top.joined(separator: " "))")
+    }
+case "snapshot":
+    // artemis-cli snapshot <game> <out.png> [x,y ...]: runs on a simulated clock; each
+    // [stop] takes the next tap (stage pixels); renders the stage when taps run out.
+    guard arguments.count >= 3 else { print("snapshot needs an output path"); exit(2) }
+    let output = URL(fileURLWithPath: arguments[2])
+    var taps = arguments.dropFirst(3).compactMap { pair -> CGPoint? in
+        let parts = pair.split(separator: ",").compactMap { Double($0) }
+        return parts.count == 2 ? CGPoint(x: parts[0], y: parts[1]) : nil
+    }
+    MainActor.assumeIsolated {
+        do {
+            let player = try ArtemisPlayer(gameRoot: game)
+            player.onLog = { message in
+                if !message.hasPrefix("debug:") && !message.hasPrefix("lua:") { print("· \(message)") }
+            }
+            try player.start()
+            var time = 0.0
+            var guardCount = 0
+            loop: while guardCount < 100_000 {
+                guardCount += 1
+                switch player.wait {
+                case let .time(until, _):
+                    time = max(time + 16, until)
+                    player.update(time: time)
+                case .stop, .click:
+                    player.update(time: time + 5000)
+                    time += 5000
+                    guard !taps.isEmpty else { break loop }
+                    let tap = taps.removeFirst()
+                    print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
+                    player.tap(at: tap)
+                case .video:
+                    player.videoFinished()
+                case .none:
+                    break loop
+                }
+                if player.failure != nil { break loop }
+            }
+            print("stopped: \(player.wait) at \(player.interpreter.location), t=\(Int(time)) ms")
+            if !player.messageText.isEmpty { print("text: \(player.messageText.prefix(300))") }
+            func dump(_ layer: ArtemisLayer, _ depth: Int) {
+                print(String(repeating: "  ", count: depth) + "\(layer.id) \(layer.file ?? (layer.color.map { String($0, radix: 16) } ?? "-")) \(Int(layer.width))x\(Int(layer.height)) @\(Int(layer.left)),\(Int(layer.top)) a=\(Int(layer.alpha)) s=\(Int(layer.xscale)) v=\(layer.visible) img=\(layer.image != nil)")
+                layer.children.forEach { dump($0, depth + 1) }
+            }
+            if ProcessInfo.processInfo.environment["ARTEMIS_TREE"] != nil { player.stage.root.children.forEach { dump($0, 0) } }
+            guard let image = player.stage.render() else { print("render failed"); return }
+            let destination = CGImageDestinationCreateWithURL(output as CFURL, "public.png" as CFString, 1, nil)!
+            CGImageDestinationAddImage(destination, image, nil)
+            CGImageDestinationFinalize(destination)
+            print("wrote \(output.path)")
+        } catch {
+            print("failed: \(error)")
+        }
+    }
 default:
     print("unknown command \(command)")
     exit(2)
