@@ -528,8 +528,9 @@ public final class ArtemisInterpreter {
             let target = tag["target"] ?? tag["data"] ?? ""
             return value(of: target) != nil ? "1" : "0"
         case "file_exist", "file_exists":
-            let file = tag["file"] ?? ""
-            // Game files, or (absolute) save files and thumbnails on disk.
+            var file = tag["file"] ?? ""
+            // save="1": relative to the save folder. Otherwise game files, or absolute paths.
+            if tag["save"] == "1", !file.hasPrefix("/"), let root = value(of: "s.savepath") { file = root + "/" + file }
             let exists = fileSystem.file(file) != nil || (file.hasPrefix("/") && FileManager.default.fileExists(atPath: file))
             return exists ? "1" : "0"
         case "os":
@@ -564,11 +565,28 @@ public final class ArtemisInterpreter {
         case "fullscreen":
             return "1"
         case "date":
+            // name.year, .month, .day, .hour, .minute, .second
+            let parts = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: .now)
+            let base = tag["name"] ?? "date"
+            for (field, value) in [("year", parts.year), ("month", parts.month), ("day", parts.day),
+                                   ("hour", parts.hour), ("minute", parts.minute), ("second", parts.second)] {
+                variables["\(base).\(field)"] = String(value ?? 0)
+            }
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy/MM/dd HH:mm:ss"
             return formatter.string(from: .now)
         case "file_update_time":
-            return "0"
+            // A file's modification time, formatted (yyyy/MM/dd, hh:mm:ss), or `noexist`.
+            var file = tag["file"] ?? ""
+            if tag["save"] == "1", !file.hasPrefix("/"), let root = value(of: "s.savepath") { file = root + "/" + file }
+            guard let date = (try? FileManager.default.attributesOfItem(atPath: file))?[.modificationDate] as? Date else {
+                return tag["noexist"] ?? "0"
+            }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            // The engine's hh is the 24-hour clock.
+            formatter.dateFormat = (tag["format"] ?? "yyyy/MM/dd HH:mm:ss").replacingOccurrences(of: "hh", with: "HH")
+            return formatter.string(from: date)
         default:
             if let host, case .done = host.perform(ArtemisTag(name: "system:" + name, attributes: tag.attributes, order: tag.order), interpreter: self) {
                 return variables[tag["name"] ?? ""] ?? ""

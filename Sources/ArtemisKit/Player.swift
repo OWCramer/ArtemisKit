@@ -464,7 +464,9 @@ public final class ArtemisPlayer: ArtemisHost {
             screenshot = renderSnapshot()
         case "savess":
             if let screenshot, let file = tag["file"] {
-                writePNG(screenshot, to: resolveSavePath(file), width: tag["width"].flatMap(Int.init), height: tag["height"].flatMap(Int.init))
+                // The engine adds .png (save screens look for "<name>.png").
+                let name = (file as NSString).pathExtension.isEmpty ? file + ".png" : file
+                writePNG(screenshot, to: resolveSavePath(name), width: tag["width"].flatMap(Int.init), height: tag["height"].flatMap(Int.init))
             }
         case "exec":
             switch tag["command"] {

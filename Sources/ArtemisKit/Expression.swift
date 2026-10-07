@@ -267,7 +267,14 @@ public enum ArtemisExpression {
                 let a = left.numberValue, b = right.numberValue
                 switch op {
                 case "*": left = .number(a * b)
-                case "/": left = .number(b == 0 ? 0 : a / b)
+                case "/":
+                    // Whole numbers divide as integers (the engine's arithmetic is integral;
+                    // save screens lay out slot rows with (i - 1) / columns).
+                    if b == 0 { left = .number(0) } else if a == a.rounded(), b == b.rounded() {
+                        left = .number((a / b).rounded(.towardZero))
+                    } else {
+                        left = .number(a / b)
+                    }
                 default: left = .number(b == 0 ? 0 : a.truncatingRemainder(dividingBy: b))
                 }
             }
