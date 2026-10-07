@@ -8,7 +8,7 @@ import Foundation
 ///     "pf" + version ("6" or "8")
 ///     u32 index size              (bytes from offset 7 to the end of the index)
 ///     u32 file count
-///     per file: u32 name length, name (UTF-8, `\` separated), u32 0, u32 offset, u32 size
+///     per file: u32 name length, name (UTF-8 or CP932, `\` separated), u32 0, u32 offset, u32 size
 ///     a table of the entries' offset-field positions (unused here)
 ///
 /// `pf8` XORs each file's bytes with the SHA-1 of the index (the bytes from offset 7 to
@@ -75,7 +75,11 @@ public final class PFSArchive: @unchecked Sendable {
             let offset = UInt64(Self.u32(index, position + 4))
             let size = UInt64(Self.u32(index, position + 8))
             position += 12
-            let name = String(decoding: nameBytes, as: UTF8.self).replacingOccurrences(of: "\\", with: "/")
+            // UTF-8 in newer games; older (Shift-JIS) games store names in CP932.
+            let decoded = String(data: Data(nameBytes), encoding: .utf8)
+                ?? String(data: Data(nameBytes), encoding: artemisScriptEncoding)
+                ?? String(decoding: nameBytes, as: UTF8.self)
+            let name = decoded.replacingOccurrences(of: "\\", with: "/")
             guard offset + size <= fileSize else { throw Failure.entryOutOfBounds(name) }
             entries.append(Entry(path: name, offset: offset, size: size))
         }

@@ -190,6 +190,29 @@ static int e_set_event_handler(lua_State *L) {
     return 0;
 }
 
+static const char *FILTER_KEY = "artemis.tagfilter";
+
+// e:setTagFilter{name = function(e, param) ... end, ...}: runs before each tag of that name.
+static int e_set_tag_filter(lua_State *L) {
+    if (lua_istable(L, 2)) lua_pushvalue(L, 2); else lua_pushnil(L);
+    lua_setfield(L, LUA_REGISTRYINDEX, FILTER_KEY);
+    return 0;
+}
+
+// e:file(path) -> the file's contents (archives included), or nil.
+static int e_file(lua_State *L) {
+    const ArtemisLuaHost *host = host_of(L);
+    size_t length = 0;
+    char *data = host->read_file(host->context, luaL_checkstring(L, 2), &length);
+    if (!data) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, data, length);
+    free(data);
+    return 1;
+}
+
 // Methods Shiori doesn't implement yet: note the call, return nil.
 static int e_unsupported(lua_State *L) {
     const ArtemisLuaHost *host = host_of(L);
@@ -258,6 +281,8 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
         {"getScriptStack", e_get_script_stack},
         {"getMousePoint", e_get_mouse_point},
         {"setEventHandler", e_set_event_handler},
+        {"setTagFilter", e_set_tag_filter},
+        {"file", e_file},
         {NULL, NULL},
     };
     for (const luaL_Reg *m = methods; m->name; m++) {
@@ -265,7 +290,7 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
         lua_setfield(L, -2, m->name);
     }
     static const char *unsupported[] = {
-        "getScriptBlock", "enqueueTag", "setTagFilter", "file", NULL,
+        "getScriptBlock", "enqueueTag", NULL,
     };
     for (const char **name = unsupported; *name; name++) {
         lua_pushstring(L, *name);
@@ -343,4 +368,32 @@ char *artemis_lua_call(lua_State *L, const char *function, int count, const char
     }
     if (lua_pcall(L, 2, 0, 0) != 0) return pop_error(L);
     return NULL;
+}
+
+int artemis_lua_filter_tag(lua_State *L, const char *name, int count, const char *const *keys, const char *const *values, char **error) {
+    *error = NULL;
+    lua_getfield(L, LUA_REGISTRYINDEX, FILTER_KEY);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return -1;
+    }
+    lua_getfield(L, -1, name);
+    lua_remove(L, -2);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return -1;
+    }
+    lua_getglobal(L, "e");
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        lua_pushstring(L, values[i]);
+        lua_setfield(L, -2, keys[i]);
+    }
+    if (lua_pcall(L, 2, 1, 0) != 0) {
+        *error = pop_error(L);
+        return 0;
+    }
+    int skip = lua_isnumber(L, -1) && lua_tonumber(L, -1) == 1;
+    lua_pop(L, 1);
+    return skip;
 }

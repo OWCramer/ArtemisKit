@@ -42,3 +42,8 @@ char *artemis_lua_call(lua_State *L, const char *function, int count, const char
 
 /// True when a global function by that (dotted) name exists.
 int artemis_lua_has_function(lua_State *L, const char *function);
+
+/// The `e:setTagFilter` function for tag `name`, called with the tag's parameters:
+/// -1 when there's none, 1 when it handled the tag (skip it), 0 to run the tag. On a Lua
+/// error, sets `*error` (malloc'd) and returns 0.
+int artemis_lua_filter_tag(lua_State *L, const char *name, int count, const char *const *keys, const char *const *values, char **error);

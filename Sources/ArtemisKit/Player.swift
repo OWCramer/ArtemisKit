@@ -464,14 +464,23 @@ public final class ArtemisPlayer: ArtemisHost {
         let text = Self.unescape(raw)
         // `@` in prose waits for a click.
         if let at = text.firstIndex(of: "@") {
-            messages.append(String(text[..<at]).replacingOccurrences(of: "\u{E000}", with: "@"))
+            printProse(String(text[..<at]).replacingOccurrences(of: "\u{E000}", with: "@"))
             let rest = String(text[text.index(after: at)...])
             pendingText = rest.isEmpty ? nil : rest
             wait = .click
             return .wait("click")
         }
-        messages.append(text.replacingOccurrences(of: "\u{E000}", with: "@"))
+        printProse(text.replacingOccurrences(of: "\u{E000}", with: "@"))
         return .done
+    }
+
+    /// Prose is a `print` to the engine, so the game's print tag filter (read-text colour,
+    /// name substitution) sees each stretch between click waits first.
+    private func printProse(_ text: String) {
+        guard !text.isEmpty else { return }
+        let tag = ArtemisTag(name: "print", attributes: ["data": text], order: ["data"])
+        if (try? interpreter.filterTag(tag)) == true { return }
+        messages.append(text)
     }
 
     /// The stage with message text on top (headless snapshots).

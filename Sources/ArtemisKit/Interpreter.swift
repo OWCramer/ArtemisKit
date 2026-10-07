@@ -85,6 +85,7 @@ public final class ArtemisInterpreter {
     nonisolated(unsafe) private var lua: OpaquePointer?
     nonisolated(unsafe) private var luaHost = ArtemisLuaHost()
     private var reportedUnhandled: Set<String> = []
+    private var inTagFilter = false
     /// Commands run, for runaway-loop protection in headless runs.
     public private(set) var steps = 0
 
@@ -205,7 +206,39 @@ public final class ArtemisInterpreter {
             break
         }
         let tag = try evaluate(name: name, rawAttributes)
+        if try filterTag(tag) { return }
         try perform(tag)
+    }
+
+    /// Runs the game's `e:setTagFilter` function for this tag, if any. True when the filter
+    /// handled the tag and it shouldn't run. Tags the filter issues itself aren't filtered.
+    func filterTag(_ tag: ArtemisTag) throws -> Bool {
+        guard let lua, !inTagFilter else { return false }
+        inTagFilter = true
+        defer { inTagFilter = false }
+        let encoding = fileSystem.encoding
+        // A trailing nil keeps the buffers non-empty for tags without parameters.
+        var keys: [UnsafeMutablePointer<CChar>?] = tag.order.map { strdup(luaBytes($0, encoding)) } + [nil]
+        var values: [UnsafeMutablePointer<CChar>?] = tag.order.map { strdup(luaBytes(tag[$0] ?? "", encoding)) } + [nil]
+        defer {
+            keys.forEach { free($0) }
+            values.forEach { free($0) }
+        }
+        var error: UnsafeMutablePointer<CChar>?
+        let result = keys.withUnsafeMutableBufferPointer { keyBuffer in
+            values.withUnsafeMutableBufferPointer { valueBuffer in
+                keyBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: keyBuffer.count) { k in
+                    valueBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: valueBuffer.count) { v in
+                        artemis_lua_filter_tag(lua, luaBytes(tag.name, encoding), Int32(tag.order.count), k, v, &error)
+                    }
+                }
+            }
+        }
+        if let error {
+            host?.log("lua tag filter \(tag.name) (continuing): \(luaString(error, encoding))")
+            free(error)
+        }
+        return result == 1
     }
 
     /// Runs one evaluated tag: control flow and variables here, macros as calls, the rest
@@ -629,7 +662,8 @@ public final class ArtemisInterpreter {
         luaHost.script_stack = { context in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
             let text = MainActor.assumeIsolated {
-                interpreter.frames.reversed().map { "\($0.script.path)\t\($0.pc)" }.joined(separator: "\n")
+                // Outermost first; the current position is the last entry (stacks[#stacks]).
+                interpreter.frames.map { "\($0.script.path)\t\($0.pc)" }.joined(separator: "\n")
             }
             return strdup(luaBytes(text, interpreter.fileSystem.encoding))
         }
@@ -704,8 +738,8 @@ public final class ArtemisInterpreter {
         }
         let error = keys.withUnsafeBufferPointer { keyBuffer in
             values.withUnsafeBufferPointer { valueBuffer in
-                keyBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: keys.count) { k in
-                    valueBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: values.count) { v in
+                keyBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: keyBuffer.count) { k in
+                    valueBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: valueBuffer.count) { v in
                         artemis_lua_call(lua, luaBytes(function, fileSystem.encoding), Int32(keys.count), k, v)
                     }
                 }
