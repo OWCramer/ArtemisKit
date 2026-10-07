@@ -51,6 +51,33 @@ public final class ArtemisPlayer: ArtemisHost {
     public var messageText: String { messages.currentLayer.text }
     /// Prose left over after an `@` click wait, shown when the reader taps.
     private var pendingText: String?
+    /// Pages read so far (speaker, text), oldest first, for the backlog.
+    public private(set) var history: [(speaker: String?, text: String)] = []
+
+    /// Keeps the page being cleared, when it's story text (not a menu's message layer).
+    private func recordHistory() {
+        let layer = messages.currentLayer
+        guard ["adv", "novel"].contains(layer.id) else { return }
+        let text = layer.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, history.last?.text != text else { return }
+        let name = messages.layers["name"]?.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "【】"))
+        history.append((name?.isEmpty == false ? name : nil, text))
+        if history.count > 500 { history.removeFirst(history.count - 500) }
+    }
+
+    /// The backlog including the page on screen now.
+    public var backlog: [(speaker: String?, text: String)] {
+        var pages = history
+        let current = messages.layers["adv"]?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !current.isEmpty, pages.last?.text != current {
+            let name = messages.layers["name"]?.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "【】"))
+            pages.append((name?.isEmpty == false ? name : nil, current))
+        }
+        return pages
+    }
+
     /// Waits interrupted by buttons or the right-click menu, restored when they return.
     private var savedWaits: [Wait] = [] {
         didSet {
@@ -537,6 +564,7 @@ public final class ArtemisPlayer: ArtemisHost {
             wait = .stop
             return .wait("stop")
         case "rp":
+            recordHistory()
             messages.clear()
         case "rt":
             messages.append("\n")
