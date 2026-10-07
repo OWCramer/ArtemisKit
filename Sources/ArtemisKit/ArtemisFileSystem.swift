@@ -72,6 +72,14 @@ public final class ArtemisFileSystem: @unchecked Sendable {
         files[path.replacingOccurrences(of: "\\", with: "/").lowercased()]
     }
 
+    /// The file on disk, for loose and patch files (archived ones have none).
+    public func url(_ path: String) -> URL? {
+        switch file(path)?.source {
+        case let .loose(url), let .patch(url): return url
+        default: return nil
+        }
+    }
+
     public func data(_ path: String) throws -> Data? {
         guard let file = file(path) else { return nil }
         return try data(of: file)

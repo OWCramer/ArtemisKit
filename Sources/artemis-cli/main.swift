@@ -134,6 +134,27 @@ case "run":
         let top = host.counts.sorted { $0.value > $1.value }.prefix(25).map { "\($0.key)×\($0.value)" }
         print("host tags: \(top.joined(separator: " "))")
     }
+case "video":
+    // artemis-cli video <file> [seconds]: decodes a movie on a simulated clock and times it.
+    let url = URL(fileURLWithPath: arguments[1])
+    let seconds = arguments.count > 2 ? Double(arguments[2]) ?? 10 : 10
+    guard let video = ArtemisVideo(url: url) else { print("can't decode \(url.lastPathComponent)"); exit(1) }
+    let start = Date()
+    var frames = 0, audioSamples = 0
+    var t = 0.0
+    while t < seconds * 1000, !video.isFinished {
+        if video.update(time: t) { frames += 1 }
+        audioSamples += video.audio(upTo: t / 1000 + 0.5).count / 2
+        t += 1000 / video.frameRate
+    }
+    let elapsed = Date().timeIntervalSince(start)
+    print("\(video.width)x\(video.height) @ \(String(format: "%.2f", video.frameRate)) fps: \(frames) frames in \(String(format: "%.2f", elapsed)) s (\(String(format: "%.1f", elapsed / Double(max(1, frames)) * 1000)) ms/frame), \(audioSamples) audio frames at \(video.audioSampleRate) Hz")
+    if let image = video.image, arguments.count > 3 {
+        let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: arguments[3]) as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationFinalize(destination)
+    }
+    exit(0)
 case "decode":
     // artemis-cli decode <game> <path>: decodes an Ogg Vorbis file from the game.
     guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("no such file"); exit(1) }
@@ -164,11 +185,14 @@ case "snapshot":
             try player.start()
             var time = 0.0
             var guardCount = 0
+            // ARTEMIS_UNTIL=<ms>: stop the clock there (to look at the middle of a video).
+            let until = ProcessInfo.processInfo.environment["ARTEMIS_UNTIL"].flatMap(Double.init) ?? .infinity
             loop: while guardCount < 100_000 {
                 guardCount += 1
+                if time >= until { break loop }
                 switch player.wait {
-                case let .time(until, _):
-                    time = max(time + 16, until)
+                case let .time(end, _):
+                    time = min(max(time + 16, end), until)
                     player.update(time: time)
                 case .stop, .click:
                     player.update(time: time + 5000)
@@ -179,6 +203,10 @@ case "snapshot":
                     if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
                 case .video:
                     player.videoFinished()
+                case .videoLayer:
+                    // Video layers play out on the clock.
+                    time += 16
+                    player.update(time: time)
                 case .dialog, .sound:
                     break loop
                 case .none:

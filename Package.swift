@@ -9,7 +9,13 @@ let package = Package(
         .executable(name: "artemis-cli", targets: ["artemis-cli"]),
     ],
     targets: [
-        .target(name: "ArtemisKit", dependencies: ["CLua", "CVorbis"]),
+        .target(name: "ArtemisKit", dependencies: ["CLua", "CVorbis", "CVideo"]),
+        // Ogg Theora (libogg + libtheora) and MPEG-1 (pl_mpeg) decoding; see Sources/CVideo/README.md.
+        .target(
+            name: "CVideo",
+            exclude: ["README.md", "ogg/COPYING", "theora/COPYING"],
+            cSettings: [.headerSearchPath("theora"), .unsafeFlags(["-w"])]
+        ),
         // Ogg Vorbis decoding (stb_vorbis); see Sources/CVorbis/README.md.
         .target(
             name: "CVorbis",

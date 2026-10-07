@@ -27,6 +27,8 @@ public final class ArtemisLayer {
     public internal(set) var children: [ArtemisLayer] = []
     /// Source path of the image, for logs and layer info.
     public var file: String?
+    /// A video layer's decoder (`[video id=...]`); its frames become `image`.
+    public var video: ArtemisVideo?
 
     init(id: String) {
         self.id = id
@@ -211,7 +213,7 @@ public final class ArtemisStage {
         // A fresh layer resets its properties, as recreating it in the engine does.
         layer.left = 0; layer.top = 0; layer.alpha = 255; layer.xscale = 100; layer.yscale = 100
         layer.rotate = 0; layer.anchorX = nil; layer.anchorY = nil; layer.visible = true
-        layer.image = nil; layer.color = nil; layer.file = nil
+        layer.image = nil; layer.color = nil; layer.file = nil; layer.video = nil
         tweens.removeAll { $0.layer == id }
         if let file = tag["file"], !file.isEmpty {
             layer.file = file
@@ -228,6 +230,36 @@ public final class ArtemisStage {
         if tag["width"] != nil, layer.image != nil { layer.width = tag.number("width") }
         if tag["height"] != nil, layer.image != nil { layer.height = tag.number("height") }
         apply(properties: tag, to: layer)
+    }
+
+    /// `[video id=...]`: makes the layer a video layer, sized to the video, showing its
+    /// first frame. Keeps children, like `[lyc]`.
+    public func createVideo(id: String, file: String, video: ArtemisVideo) {
+        let layer = ensureLayer(id)
+        layer.left = 0; layer.top = 0; layer.alpha = 255; layer.xscale = 100; layer.yscale = 100
+        layer.rotate = 0; layer.anchorX = nil; layer.anchorY = nil; layer.visible = true
+        layer.color = nil; layer.file = file
+        tweens.removeAll { $0.layer == id }
+        layer.video = video
+        layer.width = Double(video.width)
+        layer.height = Double(video.height)
+        video.update(time: clock)
+        layer.image = video.image
+        videoLayers.insert(id)
+        videoRevision += 1
+    }
+
+    /// Ids of layers that have had a video; pruned as they go.
+    private var videoLayers: Set<String> = []
+    /// Bumped when a video layer shows a new frame.
+    public private(set) var videoRevision = 0
+    /// The last `update(time:)`.
+    private var clock: Double = 0
+
+    /// Whether the video layer `id` is still playing (false once it ends or is deleted).
+    public func isVideoPlaying(_ id: String) -> Bool {
+        guard let video = layer(id)?.video else { return false }
+        return !video.isFinished
     }
 
     /// `[lyprop]`
@@ -301,6 +333,17 @@ public final class ArtemisStage {
 
     /// Advances tweens to `time` (ms). Finished ones land on their end value.
     public func update(time: Double) {
+        clock = time
+        for id in videoLayers {
+            guard let layer = layer(id), let video = layer.video else {
+                videoLayers.remove(id)
+                continue
+            }
+            if video.update(time: time) {
+                layer.image = video.image
+                videoRevision += 1
+            }
+        }
         if !tweens.isEmpty { tweenRevision += 1 }
         var remaining: [ArtemisTween] = []
         for tween in tweens {

@@ -13,8 +13,23 @@ public protocol ArtemisMediaDelegate: AnyObject {
                        answer: @escaping (Bool, String?) -> Void)
     /// Whether an effect/voice channel (`seplay id`) is still sounding.
     func isSoundPlaying(_ id: String) -> Bool
-    /// Plays a movie; call `finished` when it ends or is skipped.
-    func playVideo(_ data: Data, fileExtension: String, finished: @escaping () -> Void) -> Bool
+    /// Plays a full-screen movie; call `finished` when it ends or is skipped. Returns false
+    /// when it can't be played, and the script carries on.
+    func playVideo(_ source: ArtemisVideoSource, finished: @escaping () -> Void) -> Bool
+}
+
+/// Where a full-screen movie comes from: loose files are streamed from disk (they can be
+/// hundreds of MB); archived ones are in memory.
+public enum ArtemisVideoSource {
+    case file(URL)
+    case data(Data, fileExtension: String)
+
+    public var fileExtension: String {
+        switch self {
+        case let .file(url): return url.pathExtension.lowercased()
+        case let .data(_, ext): return ext.lowercased()
+        }
+    }
 }
 
 /// Runs an Artemis game: the interpreter plus the stage, waits, input and media.
@@ -35,6 +50,8 @@ public final class ArtemisPlayer: ArtemisHost {
         case dialog
         /// Until a sound channel finishes (`[wait se=...]`); a tap ends it when skippable.
         case sound(String, skippable: Bool)
+        /// Until a video layer ends (`[wait video=...]`); a tap ends it when skippable.
+        case videoLayer(String, skippable: Bool)
     }
 
     public let interpreter: ArtemisInterpreter
@@ -178,6 +195,11 @@ public final class ArtemisPlayer: ArtemisHost {
                 wait = .none
                 runInterpreter()
             }
+        case let .videoLayer(id, _):
+            if skipMode || !stage.isVideoPlaying(id) {
+                wait = .none
+                runInterpreter()
+            }
         case .stop:
             // Skip ends where the reader has to choose.
             if skipMode { skipMode = false }
@@ -251,7 +273,7 @@ public final class ArtemisPlayer: ArtemisHost {
             guard let (_, event) = stage.clickTarget(at: point) else { return }
             wait = .none
             fire(event.attributes, interrupt: false)
-        case .click, .time, .sound:
+        case .click, .time, .sound, .videoLayer:
             // On-screen buttons (MENU, quick save, ...) stay live while text waits; they
             // interrupt the wait and hand it back when they return.
             if case .click = wait, let (_, event) = stage.clickTarget(at: point) {
@@ -295,7 +317,7 @@ public final class ArtemisPlayer: ArtemisHost {
     /// Ends the current wait the way a plain tap does (advance text, skip a wait).
     public func advance() {
         switch wait {
-        case let .sound(_, skippable):
+        case let .sound(_, skippable), let .videoLayer(_, skippable):
             guard skippable else { return }
             wait = .none
             runInterpreter()
@@ -493,6 +515,11 @@ public final class ArtemisPlayer: ArtemisHost {
             // input: omitted or 1 lets a tap skip; 0 and 2 don't (2 only yields to skip mode).
             if time > 0 { return waitTime(until: now + time, skippable: tag["input"] == nil || tag["input"] == "1") }
         case "wait":
+            if let id = tag["video"] {
+                guard stage.isVideoPlaying(id), !skipMode else { return .done }
+                wait = .videoLayer(id, skippable: tag["input"] == "1")
+                return .wait("video")
+            }
             if let id = tag["se"] ?? tag["voice"] {
                 guard let media, media.isSoundPlaying(id), !skipMode else { return .done }
                 wait = .sound(id, skippable: tag["input"] == "1")
@@ -589,8 +616,23 @@ public final class ArtemisPlayer: ArtemisHost {
         case "print":
             messages.append(Self.unescape(tag["data"] ?? "").replacingOccurrences(of: "\u{E000}", with: "@"))
         case "video":
-            guard let file = tag["file"], let data = try? fileSystem.data(file) else { return .done }
-            if let media, media.playVideo(data, fileExtension: (file as NSString).pathExtension, finished: { [weak self] in
+            guard let file = tag["file"] else { return .done }
+            let ext = (file as NSString).pathExtension
+            if let id = tag["id"] {
+                // A video layer: decoded here, frames shown on the stage.
+                let loop = tag["loop"] == "1"
+                let video = fileSystem.url(file).flatMap { ArtemisVideo(url: $0, loop: loop) }
+                    ?? (try? fileSystem.data(file)).flatMap { $0.flatMap { ArtemisVideo(data: $0, fileExtension: ext, loop: loop) } }
+                guard let video else {
+                    log("video layer \(file) can't be decoded; skipped")
+                    return .done
+                }
+                stage.createVideo(id: id, file: file, video: video)
+                return .done
+            }
+            let source: ArtemisVideoSource? = fileSystem.url(file).map { .file($0) }
+                ?? (try? fileSystem.data(file)).flatMap { $0.map { .data($0, fileExtension: ext) } }
+            if let source, let media, media.playVideo(source, finished: { [weak self] in
                 self?.videoFinished()
             }) {
                 wait = .video
