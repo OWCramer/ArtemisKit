@@ -113,6 +113,8 @@ public final class ArtemisMessages {
         /// Link the text being written belongs to (`[link]` ... `[/link]`).
         var activeLink: Int?
         public var visible = true
+        /// `[chgmsg layered=1]`: drawn in the layer tree (at the stage layer with this id).
+        public internal(set) var layered = false
         /// `[lyprop id="~<layer>"]`: the page moved and faded as a whole.
         public var offsetX: Double = 0
         public var offsetY: Double = 0
@@ -271,6 +273,13 @@ public final class ArtemisMessages {
             layer.font = font
             touch(layer)
         }
+    }
+
+    /// `[chgmsg layered=]` for a layer.
+    public func setLayered(_ id: String, _ layered: Bool) {
+        let layer = self.layer(id)
+        layer.layered = layered
+        touch(layer)
     }
 
     /// `[/font]`: back to the font before the last `[font]`.

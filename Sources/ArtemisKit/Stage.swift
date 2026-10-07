@@ -30,6 +30,9 @@ public final class ArtemisLayer {
     public var file: String?
     /// A video layer's decoder (`[video id=...]`); its frames become `image`.
     public var video: ArtemisVideo?
+    /// Stands in for a layered message layer (`[chgmsg layered=1]`): its text draws here,
+    /// in the layer tree, instead of above every layer.
+    public var messageLayer: String?
     /// `[anime]` frames, when the layer is a flip-book.
     public var anime: ArtemisAnime?
     /// `reversex` / `reversey`: mirrored around the anchor.
@@ -366,6 +369,26 @@ public final class ArtemisStage {
         tweens.removeAll { $0.layer == id || $0.layer.hasPrefix(id + ".") }
         for key in events.keys where key == id || key.hasPrefix(id + ".") { events[key] = nil }
     }
+
+    /// `[chgmsg layered=1]`: a place in the tree for a message layer's text.
+    public func placeMessageLayer(_ id: String) {
+        let layer = ensureLayer(id)
+        guard layer.messageLayer != id else { return }
+        layer.messageLayer = id
+        layer.width = width
+        layer.height = height
+        tweenRevision += 1
+    }
+
+    /// `[chgmsg layered=0]`: the message layer goes back above the layers.
+    public func removeMessageLayer(_ id: String) {
+        guard layer(id)?.messageLayer == id else { return }
+        deleteLayer(id)
+        tweenRevision += 1
+    }
+
+    /// Draws a layered message layer's text (headless rendering).
+    public var drawMessageLayer: ((String, CGContext) -> Void)?
 
     /// `[lyrename id= to=]`: moves a layer (and its subtree, tweens and events) to a new id
     /// without reloading it.
@@ -943,6 +966,7 @@ public final class ArtemisStage {
                 context.draw(image, in: full)
                 context.restoreGState()
             }
+            if let id = layer.messageLayer { drawMessageLayer?(id, context) }
             for child in layer.children { draw(child, opacity: alpha) }
             context.restoreGState()
         }

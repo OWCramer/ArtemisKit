@@ -152,6 +152,10 @@ public final class ArtemisPlayer: ArtemisHost {
         interpreter = ArtemisInterpreter(fileSystem: fs, stageWidth: width, stageHeight: height)
         interpreter.host = self
         interpreter.systemVariable = { [weak self] name in self?.systemVariable(name) }
+        stage.drawMessageLayer = { [weak self] id, context in
+            guard let self, let layer = self.messages.layers[id] else { return }
+            self.textRenderer.draw(layer, in: context)
+        }
     }
 
     /// Where `[save]` files go (the game's saves folder in Shiori).
@@ -247,6 +251,10 @@ public final class ArtemisPlayer: ArtemisHost {
         frameEdges = pendingEdges
         pendingEdges = [:]
         stage.holdsVideoFrames = skipMode
+        // Layered message layers keep their place even if the game cleared the tree.
+        for layer in messages.layers.values where layer.layered && stage.layer(layer.id)?.messageLayer != layer.id {
+            stage.placeMessageLayer(layer.id)
+        }
         stage.update(time: time)
         // Tween completion handlers (a choice's time limit) run like layer events, once
         // the script is waiting on buttons.
@@ -782,7 +790,8 @@ public final class ArtemisPlayer: ArtemisHost {
         context.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
         context.translateBy(x: 0, y: CGFloat(h))
         context.scaleBy(x: scale, y: -scale)
-        for layer in messages.layers.values.sorted(by: { $0.id < $1.id }) { textRenderer.draw(layer, in: context) }
+        // Layered message layers were drawn in the tree; the rest go on top.
+        for layer in messages.layers.values.sorted(by: { $0.id < $1.id }) where !layer.layered { textRenderer.draw(layer, in: context) }
         return context.makeImage()
     }
 
@@ -1062,6 +1071,10 @@ public final class ArtemisPlayer: ArtemisHost {
             messages.setPageHidden(false)
         case "chgmsg":
             messages.change(to: tag["id"], push: tag["stack"] != "0")
+            if let layered = tag["layered"], let id = tag["id"] {
+                messages.setLayered(id, layered == "1")
+                if layered == "1" { stage.placeMessageLayer(id) } else { stage.removeMessageLayer(id) }
+            }
             if traceMessages { record("chgmsg \(tag["id"] ?? "?") stack=\(tag["stack"] ?? "1") at \(interpreter.location)") }
         case "/chgmsg":
             messages.change(to: nil)

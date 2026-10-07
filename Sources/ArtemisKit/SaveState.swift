@@ -20,6 +20,7 @@ struct ArtemisSaveState: Codable {
         var width, height, left, top, alpha, xscale, yscale, rotate: Double
         var anchorX, anchorY: Double?
         var visible: Bool
+        var messageLayer: String?
     }
 
     struct Message: Codable {
@@ -31,6 +32,7 @@ struct ArtemisSaveState: Codable {
         /// The page as styled runs (saves from before runs have text only).
         var runs: [ArtemisMessages.Run]?
         var links: [ArtemisMessages.Link]?
+        var layered: Bool?
     }
 
     var version = 1
@@ -58,7 +60,8 @@ extension ArtemisStage {
         func visit(_ layer: ArtemisLayer) {
             result.append(.init(id: layer.id, file: layer.file, color: layer.color, width: layer.width, height: layer.height,
                                 left: layer.left, top: layer.top, alpha: layer.alpha, xscale: layer.xscale, yscale: layer.yscale,
-                                rotate: layer.rotate, anchorX: layer.anchorX, anchorY: layer.anchorY, visible: layer.visible))
+                                rotate: layer.rotate, anchorX: layer.anchorX, anchorY: layer.anchorY, visible: layer.visible,
+                                messageLayer: layer.messageLayer))
             layer.children.forEach(visit)
         }
         root.children.forEach(visit)
@@ -79,6 +82,7 @@ extension ArtemisStage {
             layer.alpha = saved.alpha; layer.xscale = saved.xscale; layer.yscale = saved.yscale
             layer.rotate = saved.rotate; layer.anchorX = saved.anchorX; layer.anchorY = saved.anchorY
             layer.visible = saved.visible
+            layer.messageLayer = saved.messageLayer
         }
         restoreEvents(events)
     }
@@ -87,7 +91,7 @@ extension ArtemisStage {
 extension ArtemisMessages {
     func saved() -> ([ArtemisSaveState.Message], String, [String], Font) {
         (layers.values.map { .init(id: $0.id, font: $0.font, text: $0.text, visible: $0.visible, pageHidden: $0.pageHidden,
-                                   runs: $0.runs, links: $0.links) },
+                                   runs: $0.runs, links: $0.links, layered: $0.layered) },
          current, stackSnapshot, defaultFont)
     }
 
@@ -99,6 +103,7 @@ extension ArtemisMessages {
             layer.font = saved.font
             if let runs = saved.runs { layer.runs = runs } else { layer.text = saved.text }
             layer.links = saved.links ?? []
+            layer.layered = saved.layered ?? false
             layer.visible = saved.visible
             layer.pageHidden = saved.pageHidden
             layer.revision += 1
