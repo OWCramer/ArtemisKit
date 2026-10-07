@@ -91,21 +91,30 @@ private func temporaryFolder() throws -> URL {
     @Test func updatesOverrideAndPatchWins() throws {
         let game = try temporaryFolder()
         let patch = try temporaryFolder()
-        try makeArchive([("tag.ini", Data("base".utf8)), ("bg/a.png", Data("A".utf8))]).write(to: game.appendingPathComponent("root.pfs"))
+        try makeArchive([("tag.ini", Data("base".utf8)), ("bg/a.png", Data("A".utf8)), ("Config.lua", Data("archived".utf8))]).write(to: game.appendingPathComponent("root.pfs"))
         try makeArchive([("tag.ini", Data("update 1".utf8))]).write(to: game.appendingPathComponent("root.pfs.001"))
         try makeArchive([("tag.ini", Data("update 0".utf8)), ("bg/b.png", Data("B".utf8))]).write(to: game.appendingPathComponent("root.pfs.000"))
-        try makeArchive([("voice/x.ogg", Data("X".utf8))]).write(to: game.appendingPathComponent("voice.pfs"))
+        // Other archives stand in for folders named after them, nested ones included.
+        try makeArchive([("x.ogg", Data("X".utf8))]).write(to: game.appendingPathComponent("voice.pfs"))
+        try FileManager.default.createDirectory(at: game.appendingPathComponent("image/fg"), withIntermediateDirectories: true)
+        try makeArchive([("pose/a.png", Data("FG".utf8))]).write(to: game.appendingPathComponent("image/fg/akane.pfs"))
         try Data("loose".utf8).write(to: game.appendingPathComponent("system.ini"))
+        // Loose files win over the root archive.
+        try Data("loose lua".utf8).write(to: game.appendingPathComponent("config.lua"))
         try FileManager.default.createDirectory(at: patch.appendingPathComponent("BG"), withIntermediateDirectories: true)
         try Data("patched".utf8).write(to: patch.appendingPathComponent("BG/A.png"))
 
+        // Folder archives load first, the root set last.
         #expect(try ArtemisFileSystem.archiveURLs(in: game).map(\.lastPathComponent)
-            == ["root.pfs", "root.pfs.000", "root.pfs.001", "voice.pfs"])
+            == ["akane.pfs", "voice.pfs", "root.pfs", "root.pfs.000", "root.pfs.001"])
         let fs = try ArtemisFileSystem(gameRoot: game, patchRoot: patch)
         #expect(try fs.data("tag.ini") == Data("update 1".utf8))
+        #expect(try fs.data("Config.lua") == Data("loose lua".utf8))
         #expect(try fs.data("bg/b.png") == Data("B".utf8))
         #expect(try fs.data("BG\\a.PNG") == Data("patched".utf8))
         #expect(try fs.data("voice/x.ogg") == Data("X".utf8))
+        #expect(try fs.data("image/fg/akane/pose/a.png") == Data("FG".utf8))
+        #expect(fs.file("x.ogg") == nil)
         #expect(try fs.data("system.ini") == Data("loose".utf8))
         #expect(fs.file("missing.txt") == nil)
     }

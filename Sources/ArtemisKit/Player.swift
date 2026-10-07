@@ -773,7 +773,7 @@ public final class ArtemisPlayer: ArtemisHost {
         guard let data = try? fs.data("system.ini") else { return [:] }
         var section = ""
         var values: [String: String] = [:]
-        for raw in decodeScriptText(data).split(whereSeparator: \.isNewline) {
+        for raw in decodeScriptText(data, encoding: fs.encoding).split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix(";") { continue }
             if line.hasPrefix("[") { section = line.uppercased(); continue }

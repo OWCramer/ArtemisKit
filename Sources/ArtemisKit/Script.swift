@@ -5,11 +5,12 @@ public let artemisScriptEncoding = String.Encoding(
     rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.dosJapanese.rawValue))
 )
 
-/// Decodes script bytes: CP932, falling back to UTF-8 (newer games) and then Latin-1.
-public func decodeScriptText(_ data: Data) -> String {
+/// Decodes script bytes in the game's encoding (CP932 unless `system.ini` says UTF-8),
+/// falling back to the other one and then lossy UTF-8.
+public func decodeScriptText(_ data: Data, encoding: String.Encoding = artemisScriptEncoding) -> String {
     if data.starts(with: [0xEF, 0xBB, 0xBF]), let text = String(data: data.dropFirst(3), encoding: .utf8) { return text }
-    return String(data: data, encoding: artemisScriptEncoding)
-        ?? String(data: data, encoding: .utf8)
+    return String(data: data, encoding: encoding)
+        ?? String(data: data, encoding: encoding == .utf8 ? artemisScriptEncoding : .utf8)
         ?? String(decoding: data, as: UTF8.self)
 }
 
@@ -46,9 +47,9 @@ public struct ArtemisScript: Sendable {
     /// `loop` -> its `/loop`, and `/loop` -> its `loop`.
     let loopPartner: [Int: Int]
 
-    public init(path: String, data: Data) {
+    public init(path: String, data: Data, encoding: String.Encoding = artemisScriptEncoding) {
         self.path = path
-        let commands = ScriptParser.parse(data)
+        let commands = ScriptParser.parse(data, encoding: encoding)
         self.commands = commands
         var labels: [String: Int] = [:]
         var nextBranch: [Int: Int] = [:]
@@ -98,7 +99,7 @@ public struct ArtemisScript: Sendable {
 }
 
 enum ScriptParser {
-    static func parse(_ data: Data) -> [ScriptCommand] {
+    static func parse(_ data: Data, encoding: String.Encoding) -> [ScriptCommand] {
         var commands: [ScriptCommand] = []
         var autoInsert: [String: [ScriptCommand.Kind]] = [:]
         var lineTagPrefix: Character?
@@ -115,7 +116,7 @@ enum ScriptParser {
             if lineData.last == 0x0D { lineData.removeLast() }
 
             if var buffer = luaBuffer {
-                let text = decodeScriptText(lineData)
+                let text = decodeScriptText(lineData, encoding: encoding)
                 if text.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("[/lua]") {
                     commands.append(ScriptCommand(kind: .lua(buffer), line: luaStartLine))
                     luaBuffer = nil
@@ -127,7 +128,7 @@ enum ScriptParser {
                 continue
             }
 
-            var text = decodeScriptText(lineData)
+            var text = decodeScriptText(lineData, encoding: encoding)
             // /* block comments */, possibly spanning lines.
             if inBlockComment {
                 guard let end = text.range(of: "*/") else { continue }

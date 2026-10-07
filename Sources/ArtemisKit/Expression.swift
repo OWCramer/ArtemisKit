@@ -4,6 +4,9 @@ import Foundation
 public enum ArtemisValue: Equatable, Sendable {
     case number(Double)
     case string(String)
+    /// A variable's stored text: a number in arithmetic when it reads as one, but joined
+    /// as written (`"100.10" + '.1'` is `100.10.1`, which the button macros rely on).
+    case stored(String)
 
     public init(_ text: String) {
         if let number = ArtemisValue.number(from: text) { self = .number(number) } else { self = .string(text) }
@@ -23,7 +26,7 @@ public enum ArtemisValue: Equatable, Sendable {
 
     public var text: String {
         switch self {
-        case let .string(s): return s
+        case let .string(s), let .stored(s): return s
         case let .number(n): return ArtemisValue.format(n)
         }
     }
@@ -31,16 +34,25 @@ public enum ArtemisValue: Equatable, Sendable {
     public var numberValue: Double {
         switch self {
         case let .number(n): return n
-        case let .string(s): return ArtemisValue.number(from: s) ?? 0
+        case let .string(s), let .stored(s): return ArtemisValue.number(from: s) ?? 0
         }
     }
 
     public var isTrue: Bool {
         switch self {
         case let .number(n): return n != 0
-        case let .string(s):
+        case let .string(s), let .stored(s):
             if let n = ArtemisValue.number(from: s) { return n != 0 }
             return !s.isEmpty
+        }
+    }
+
+    /// Adds rather than concatenates under `+`.
+    var isNumeric: Bool {
+        switch self {
+        case .number: return true
+        case .string: return false
+        case let .stored(s): return ArtemisValue.number(from: s) != nil
         }
     }
 
@@ -247,7 +259,7 @@ public enum ArtemisExpression {
                 let right = try parseMultiplicative()
                 if op == "+" {
                     // Numbers add; anything involving a string concatenates.
-                    if case .number = left, case .number = right {
+                    if left.isNumeric, right.isNumeric {
                         left = .number(left.numberValue + right.numberValue)
                     } else {
                         left = .string(left.text + right.text)
@@ -322,7 +334,7 @@ public enum ArtemisExpression {
                 // Variables keep their stored text; numeric text acts as a number.
                 // Unset variables are 0, as in the engine.
                 guard let value = lookup(n) else { return .number(0) }
-                return ArtemisValue(value)
+                return .stored(value)
             case .op("("):
                 let value = try parseOr()
                 guard next() == .op(")") else { throw ExpressionError(description: "missing )") }

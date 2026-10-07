@@ -1,16 +1,16 @@
 import Foundation
 
 /// The files an Artemis game sees: its `.pfs` archives plus loose files, resolved the way
-/// the engine resolves them, with Shiori's patch folder on top.
+/// the engine resolves them (the engine's `spec/pack_file.txt`), with Shiori's patch
+/// folder on top.
 ///
-/// Archives come in sets: `root.pfs`, then updates `root.pfs.000`, `root.pfs.001`, ...,
-/// each overriding the ones before (newer games split content across several sets, e.g.
-/// `system.pfs`, `scenario_en.pfs`, `voice.pfs`). Paths are matched case-insensitively,
-/// as on Windows.
+/// The **root archive** is `<exe name>.pfs`, or `root.pfs`; its files appear at their own
+/// paths. Every other archive behaves like a folder named after itself, wherever it sits:
+/// `image.pfs` holds `image/bar.png`, `chara/face.pfs` holds `chara/face/large/a.png`.
+/// Each archive can be patched by `name.pfs.000` … `.999`, later numbers overriding
+/// earlier ones. Paths are matched case-insensitively, as on Windows.
 ///
-/// Lookup order: `patch/` loose files, then archives from the last-loaded update back to
-/// the first, then loose files beside the archives (where newer games keep `system.ini`,
-/// `tag.ini` and `Config.lua`).
+/// Lookup order: `patch/`, loose files, the root archive, then the folder archives.
 public final class ArtemisFileSystem: @unchecked Sendable {
     public enum Source: Hashable, Sendable {
         case archive(URL)
@@ -27,32 +27,45 @@ public final class ArtemisFileSystem: @unchecked Sendable {
     }
 
     public let gameRoot: URL
-    /// Archives in load order (later ones override earlier ones).
+    /// Archives in load order: folder archives, then the root archive (each set's base
+    /// followed by its numbered patches, later ones overriding earlier ones).
     public let archives: [PFSArchive]
     /// Every visible file, keyed by lowercased path; overridden copies are dropped.
     public let files: [String: File]
+    /// The game's text encoding: Shift-JIS (CP932) unless `system.ini` says
+    /// `CHARSET = UTF-8`, as newer games do.
+    public private(set) var encoding = artemisScriptEncoding
 
     public init(gameRoot: URL, patchRoot: URL? = nil) throws {
         self.gameRoot = gameRoot
-        let archives = try Self.archiveURLs(in: gameRoot).map(PFSArchive.init(url:))
-        self.archives = archives
-
+        let sets = try Self.archiveSets(in: gameRoot)
+        var archives: [PFSArchive] = []
         var files: [String: File] = [:]
         // Lowest precedence first; later assignments win.
+        for set in sets.sorted(by: { !$0.isRoot && $1.isRoot }) {
+            for url in set.urls {
+                let archive = try PFSArchive(url: url)
+                archives.append(archive)
+                for entry in archive.entries {
+                    let path = set.mount.isEmpty ? entry.path : set.mount + "/" + entry.path
+                    files[path.lowercased()] = File(path: path, size: entry.size, source: .archive(archive.url), entry: entry)
+                }
+            }
+        }
         for (relative, url, size) in Self.looseFiles(in: gameRoot, skipping: { $0.contains(".pfs") }) {
             files[relative.lowercased()] = File(path: relative, size: size, source: .loose(url), entry: nil)
-        }
-        for archive in archives {
-            for entry in archive.entries {
-                files[entry.path.lowercased()] = File(path: entry.path, size: entry.size, source: .archive(archive.url), entry: entry)
-            }
         }
         if let patchRoot {
             for (relative, url, size) in Self.looseFiles(in: patchRoot, skipping: { _ in false }) {
                 files[relative.lowercased()] = File(path: relative, size: size, source: .patch(url), entry: nil)
             }
         }
+        self.archives = archives
         self.files = files
+        if let ini = try? data("system.ini"),
+           String(decoding: ini, as: UTF8.self).range(of: #"(?im)^\s*CHARSET\s*=\s*UTF-?8"#, options: .regularExpression) != nil {
+            encoding = .utf8
+        }
     }
 
     public func file(_ path: String) -> File? {
@@ -76,29 +89,47 @@ public final class ArtemisFileSystem: @unchecked Sendable {
         }
     }
 
-    /// `.pfs` files in the game folder, in the order Artemis loads them: each set's base
-    /// archive followed by its numbered updates. Sets are ordered by name, with `root` first.
-    public static func archiveURLs(in gameRoot: URL) throws -> [URL] {
-        let names = try FileManager.default.contentsOfDirectory(atPath: gameRoot.path)
-        var sets: [String: [(Int, String)]] = [:]
-        for name in names {
-            let lower = name.lowercased()
-            guard let range = lower.range(of: ".pfs") else { continue }
-            let base = String(lower[..<range.lowerBound])
+    struct ArchiveSet {
+        /// Folder the archive stands in for (`image`, `chara/face`); empty for the root.
+        var mount: String
+        var isRoot: Bool
+        /// The base archive followed by its numbered patches, in order.
+        var urls: [URL]
+    }
+
+    /// Every `.pfs` set under the game folder, grouped with its numbered patches.
+    static func archiveSets(in gameRoot: URL) throws -> [ArchiveSet] {
+        let rootPath = gameRoot.standardizedFileURL.path
+        guard let enumerator = FileManager.default.enumerator(at: gameRoot, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
+        var groups: [String: [(Int, URL)]] = [:]
+        var exeNames: Set<String> = []
+        for case let url as URL in enumerator {
+            let path = url.standardizedFileURL.path
+            guard path.hasPrefix(rootPath + "/") else { continue }
+            let relative = String(path.dropFirst(rootPath.count + 1))
+            let lower = relative.lowercased()
+            if !lower.contains("/"), lower.hasSuffix(".exe") { exeNames.insert(String(lower.dropLast(4))) }
+            guard let range = lower.range(of: ".pfs", options: .backwards) else { continue }
             let suffix = lower[range.upperBound...]
+            let mount = String(relative[..<relative.index(relative.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.lowerBound))])
             if suffix.isEmpty {
-                sets[base, default: []].append((-1, name))
+                groups[mount, default: []].append((-1, url))
             } else if suffix.first == ".", let number = Int(suffix.dropFirst()) {
-                sets[base, default: []].append((number, name))
+                groups[mount, default: []].append((number, url))
             }
         }
-        let order = sets.keys.sorted { a, b in
-            if a == "root" || b == "root" { return a == "root" && b != "root" }
-            return a < b
+        // The root archive: the one named after the exe, else root.pfs.
+        let topLevel = groups.keys.filter { !$0.contains("/") }
+        let root = topLevel.first { exeNames.contains($0.lowercased()) } ?? topLevel.first { $0.lowercased() == "root" }
+        return groups.keys.sorted { $0.lowercased() < $1.lowercased() }.map { mount in
+            ArchiveSet(mount: mount == root ? "" : mount, isRoot: mount == root,
+                       urls: groups[mount]!.sorted { $0.0 < $1.0 }.map(\.1))
         }
-        return order.flatMap { base in
-            sets[base]!.sorted { $0.0 < $1.0 }.map { gameRoot.appendingPathComponent($0.1) }
-        }
+    }
+
+    /// `.pfs` files under the game folder, in load order.
+    public static func archiveURLs(in gameRoot: URL) throws -> [URL] {
+        try archiveSets(in: gameRoot).sorted { !$0.isRoot && $1.isRoot }.flatMap(\.urls)
     }
 
     private static func looseFiles(in root: URL, skipping skip: (String) -> Bool) -> [(String, URL, UInt64)] {

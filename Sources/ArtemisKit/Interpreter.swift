@@ -90,7 +90,7 @@ public final class ArtemisInterpreter {
 
     public init(fileSystem: ArtemisFileSystem, stageWidth: Int, stageHeight: Int) {
         self.fileSystem = fileSystem
-        if let data = try? fileSystem.data("tag.ini") { tagParameters = Self.parseTagIni(decodeScriptText(data)) }
+        if let data = try? fileSystem.data("tag.ini") { tagParameters = Self.parseTagIni(decodeScriptText(data, encoding: fileSystem.encoding)) }
         variables["sc.width"] = String(stageWidth)
         variables["sc.height"] = String(stageHeight)
         variables["os.name"] = "iphone"
@@ -363,7 +363,7 @@ public final class ArtemisInterpreter {
         let key = path.replacingOccurrences(of: "\\", with: "/").lowercased()
         if let script = scripts[key] { return script }
         guard let data = try fileSystem.data(path) else { throw ArtemisScriptError(description: "no script \(path)") }
-        let script = ArtemisScript(path: path, data: data)
+        let script = ArtemisScript(path: path, data: data, encoding: fileSystem.encoding)
         scripts[key] = script
         return script
     }
@@ -611,16 +611,16 @@ public final class ArtemisInterpreter {
         luaHost.var = { context, name in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
             // Unset variables read as "0" (first-boot checks rely on it).
-            let value = MainActor.assumeIsolated { interpreter.value(of: luaString(name!)) } ?? "0"
-            return strdup(luaBytes(value))
+            let value = MainActor.assumeIsolated { interpreter.value(of: luaString(name!, interpreter.fileSystem.encoding)) } ?? "0"
+            return strdup(luaBytes(value, interpreter.fileSystem.encoding))
         }
         luaHost.debug = { context, message in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
-            MainActor.assumeIsolated { interpreter.host?.log("lua: \(luaString(message!))") }
+            MainActor.assumeIsolated { interpreter.host?.log("lua: \(luaString(message!, interpreter.fileSystem.encoding))") }
         }
         luaHost.read_file = { context, path, length in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
-            guard let data = try? interpreter.fileSystem.data(luaString(path!)) else { return nil }
+            guard let data = try? interpreter.fileSystem.data(luaString(path!, interpreter.fileSystem.encoding)) else { return nil }
             length?.pointee = data.count
             let buffer = malloc(max(1, data.count))!.assumingMemoryBound(to: CChar.self)
             data.withUnsafeBytes { buffer.update(from: $0.bindMemory(to: CChar.self).baseAddress!, count: data.count) }
@@ -631,7 +631,7 @@ public final class ArtemisInterpreter {
             let text = MainActor.assumeIsolated {
                 interpreter.frames.reversed().map { "\($0.script.path)\t\($0.pc)" }.joined(separator: "\n")
             }
-            return strdup(luaBytes(text))
+            return strdup(luaBytes(text, interpreter.fileSystem.encoding))
         }
         luaHost.unsupported = { context, method in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
@@ -648,7 +648,7 @@ public final class ArtemisInterpreter {
         }
         luaHost.set_event_handler = { context, event, function in
             let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
-            let name = String(cString: event!), value = luaString(function!)
+            let name = String(cString: event!), value = luaString(function!, interpreter.fileSystem.encoding)
             MainActor.assumeIsolated { interpreter.luaEventHandlers[name] = value.isEmpty ? nil : value }
         }
         lua = withUnsafePointer(to: &luaHost) { artemis_lua_open($0) }
@@ -660,11 +660,11 @@ public final class ArtemisInterpreter {
         var attributes: [String: String] = [:]
         var order: [String] = []
         for i in 0 ..< count {
-            let key = luaString(keys[i]!)
-            attributes[key] = luaString(values[i]!)
+            let key = luaString(keys[i]!, fileSystem.encoding)
+            attributes[key] = luaString(values[i]!, fileSystem.encoding)
             order.append(key)
         }
-        let tag = ArtemisTag(name: luaString(name), attributes: attributes, order: order)
+        let tag = ArtemisTag(name: luaString(name, fileSystem.encoding), attributes: attributes, order: order)
         do {
             if tag.name == "call" {
                 try runNested(file: tag["file"], label: tag["label"])
@@ -684,7 +684,7 @@ public final class ArtemisInterpreter {
             artemis_lua_run(lua, bytes.bindMemory(to: CChar.self).baseAddress, code.count, chunk)
         }
         if let error {
-            let message = luaString(error)
+            let message = luaString(error, fileSystem.encoding)
             free(error)
             throw ArtemisScriptError(description: "lua: \(message)")
         }
@@ -695,8 +695,8 @@ public final class ArtemisInterpreter {
         var keys: [UnsafeMutablePointer<CChar>?] = []
         var values: [UnsafeMutablePointer<CChar>?] = []
         for key in tag.order where key != "function" {
-            keys.append(strdup(luaBytes(key)))
-            values.append(strdup(luaBytes(tag[key] ?? "")))
+            keys.append(strdup(luaBytes(key, fileSystem.encoding)))
+            values.append(strdup(luaBytes(tag[key] ?? "", fileSystem.encoding)))
         }
         defer {
             keys.forEach { free($0) }
@@ -706,26 +706,26 @@ public final class ArtemisInterpreter {
             values.withUnsafeBufferPointer { valueBuffer in
                 keyBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: keys.count) { k in
                     valueBuffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self, capacity: values.count) { v in
-                        artemis_lua_call(lua, luaBytes(function), Int32(keys.count), k, v)
+                        artemis_lua_call(lua, luaBytes(function, fileSystem.encoding), Int32(keys.count), k, v)
                     }
                 }
             }
         }
         if let error {
-            let message = luaString(error)
+            let message = luaString(error, fileSystem.encoding)
             free(error)
             throw ArtemisScriptError(description: "lua \(function): \(message)")
         }
     }
 }
 
-/// Lua works in the game's bytes (CP932); these convert at the boundary.
-func luaString(_ pointer: UnsafePointer<CChar>) -> String {
+/// Lua works in the game's bytes (CP932 or UTF-8); these convert at the boundary.
+func luaString(_ pointer: UnsafePointer<CChar>, _ encoding: String.Encoding) -> String {
     let data = Data(bytes: pointer, count: strlen(pointer))
-    return String(data: data, encoding: artemisScriptEncoding) ?? String(cString: pointer)
+    return String(data: data, encoding: encoding) ?? String(cString: pointer)
 }
 
-func luaBytes(_ string: String) -> [CChar] {
-    let data = string.data(using: artemisScriptEncoding, allowLossyConversion: true) ?? Data(string.utf8)
+func luaBytes(_ string: String, _ encoding: String.Encoding) -> [CChar] {
+    let data = string.data(using: encoding, allowLossyConversion: true) ?? Data(string.utf8)
     return data.map { CChar(bitPattern: $0) } + [0]
 }
