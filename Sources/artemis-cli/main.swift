@@ -179,7 +179,7 @@ case "snapshot":
                     if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
                 case .video:
                     player.videoFinished()
-                case .dialog:
+                case .dialog, .sound:
                     break loop
                 case .none:
                     break loop

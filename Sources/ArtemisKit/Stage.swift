@@ -142,7 +142,7 @@ public final class ArtemisStage {
     public private(set) var events: [String: [String: ArtemisLayerEvent]] = [:]
     /// Bumped on flip/trans: the presenter shows changes then (with a transition for trans).
     public private(set) var presentationCount = 0
-    public private(set) var lastTransition: (type: String, duration: Double, rule: String?)?
+    public private(set) var lastTransition: (type: String, duration: Double, rule: String?, vague: Double)?
 
     private var imageCache: [String: CGImage] = [:]
     let loadImage: (String) -> CGImage?
@@ -246,12 +246,28 @@ public final class ArtemisStage {
         }
     }
 
-    func image(_ file: String) -> CGImage? {
-        if let cached = imageCache[file] { return cached }
+    public func image(_ file: String) -> CGImage? {
+        if let cached = imageCache[file] {
+            cacheOrder.removeAll { $0 == file }
+            cacheOrder.append(file)
+            return cached
+        }
         guard let image = loadImage(file) else { return nil }
         imageCache[file] = image
+        cacheOrder.append(file)
+        cacheBytes += image.bytesPerRow * image.height
+        // Least recently used first; images still on screen stay alive through their layers.
+        while cacheBytes > Self.cacheLimit, cacheOrder.count > 1 {
+            let evicted = cacheOrder.removeFirst()
+            if let old = imageCache.removeValue(forKey: evicted) { cacheBytes -= old.bytesPerRow * old.height }
+        }
         return image
     }
+
+    /// Decoded images kept for reuse (a few dozen full-screen backgrounds).
+    static let cacheLimit = 256 << 20
+    private var cacheOrder: [String] = []
+    private var cacheBytes = 0
 
     // MARK: Tweens
 
@@ -301,7 +317,7 @@ public final class ArtemisStage {
     public func present(transition tag: ArtemisTag?) {
         presentationCount += 1
         if let tag {
-            lastTransition = (tag["type"] ?? "1", tag.number("time"), tag["rule"])
+            lastTransition = (tag["type"] ?? "1", tag.number("time"), tag["rule"], tag.number("vague", default: 32))
         } else {
             lastTransition = nil
         }

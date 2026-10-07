@@ -11,6 +11,8 @@ public protocol ArtemisMediaDelegate: AnyObject {
     /// optional text field. Call `answer(ok, text)` when the reader responds.
     func presentDialog(title: String, message: String, cancellable: Bool, textField: Bool,
                        answer: @escaping (Bool, String?) -> Void)
+    /// Whether an effect/voice channel (`seplay id`) is still sounding.
+    func isSoundPlaying(_ id: String) -> Bool
     /// Plays a movie; call `finished` when it ends or is skipped.
     func playVideo(_ data: Data, fileExtension: String, finished: @escaping () -> Void) -> Bool
 }
@@ -31,6 +33,8 @@ public final class ArtemisPlayer: ArtemisHost {
         case video
         /// Until the reader answers an OS dialog.
         case dialog
+        /// Until a sound channel finishes (`[wait se=...]`); a tap ends it when skippable.
+        case sound(String, skippable: Bool)
     }
 
     public let interpreter: ArtemisInterpreter
@@ -138,9 +142,14 @@ public final class ArtemisPlayer: ArtemisHost {
             }
         case .click:
             let autoDelay = Double(interpreter.value(of: "s.automodewait") ?? "") ?? 2000
-            if messages.isRevealing { waitStarted = time }
+            if messages.isRevealing || (autoMode && voicePlaying) { waitStarted = time }
             if skipMode || (autoMode && !messages.isRevealing && time - waitStarted >= max(300, autoDelay)) {
                 advance()
+            }
+        case let .sound(id, _):
+            if skipMode || !(media?.isSoundPlaying(id) ?? false) {
+                wait = .none
+                runInterpreter()
             }
         case .stop:
             // Skip ends where the reader has to choose.
@@ -151,6 +160,13 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     private var waitKind: Wait = .none
+
+    /// A synced channel (the game's `g.syncse` list, voices) is still speaking.
+    private var voicePlaying: Bool {
+        guard let media else { return false }
+        let ids = (interpreter.value(of: "g.syncse") ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        return ids.contains { media.isSoundPlaying($0) }
+    }
     private var lastUpdate: Double = 0
     private var waitStarted: Double = 0
 
@@ -208,7 +224,7 @@ public final class ArtemisPlayer: ArtemisHost {
             guard let (_, event) = stage.clickTarget(at: point) else { return }
             wait = .none
             fire(event.attributes, interrupt: false)
-        case .click, .time:
+        case .click, .time, .sound:
             // On-screen buttons (MENU, quick save, ...) stay live while text waits; they
             // interrupt the wait and hand it back when they return.
             if case .click = wait, let (_, event) = stage.clickTarget(at: point) {
@@ -252,6 +268,10 @@ public final class ArtemisPlayer: ArtemisHost {
     /// Ends the current wait the way a plain tap does (advance text, skip a wait).
     public func advance() {
         switch wait {
+        case let .sound(_, skippable):
+            guard skippable else { return }
+            wait = .none
+            runInterpreter()
         case let .time(_, skippable):
             guard skippable else { return }
             finishTweensNow()
@@ -371,16 +391,37 @@ public final class ArtemisPlayer: ArtemisHost {
         record(message)
     }
 
-    public func show(text: String, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
+    /// Backslash escapes in prose: `\;` `\@` `\ ` stand for the character itself (a leading
+    /// `;` would be a comment, a bare `@` a click wait). `\@` becomes a placeholder so the
+    /// click-wait split below leaves it alone.
+    static func unescape(_ text: String) -> String {
+        guard text.contains("\\") else { return text }
+        var result = ""
+        var escaped = false
+        for character in text {
+            if escaped {
+                result.append(character == "@" ? "\u{E000}" : character)
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else {
+                result.append(character)
+            }
+        }
+        return result
+    }
+
+    public func show(text raw: String, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
+        let text = Self.unescape(raw)
         // `@` in prose waits for a click.
         if let at = text.firstIndex(of: "@") {
-            messages.append(String(text[..<at]))
+            messages.append(String(text[..<at]).replacingOccurrences(of: "\u{E000}", with: "@"))
             let rest = String(text[text.index(after: at)...])
             pendingText = rest.isEmpty ? nil : rest
             wait = .click
             return .wait("click")
         }
-        messages.append(text)
+        messages.append(text.replacingOccurrences(of: "\u{E000}", with: "@"))
         return .done
     }
 
@@ -425,7 +466,11 @@ public final class ArtemisPlayer: ArtemisHost {
             // input: omitted or 1 lets a tap skip; 0 and 2 don't (2 only yields to skip mode).
             if time > 0 { return waitTime(until: now + time, skippable: tag["input"] == nil || tag["input"] == "1") }
         case "wait":
-            if tag["se"] != nil || tag["voice"] != nil { return .done } // sound-completion waits: not yet
+            if let id = tag["se"] ?? tag["voice"] {
+                guard let media, media.isSoundPlaying(id), !skipMode else { return .done }
+                wait = .sound(id, skippable: tag["input"] == "1")
+                return .wait("sound")
+            }
             let time = tag.number("time")
             // input: 1 lets a tap end it; omitted/0 and 2 don't.
             if time > 0 { return waitTime(until: now + time, skippable: tag["input"] == "1") }
@@ -514,7 +559,7 @@ public final class ArtemisPlayer: ArtemisHost {
         case "fontdefault":
             messages.setFont(tag, defaults: true)
         case "print":
-            messages.append(tag["data"] ?? "")
+            messages.append(Self.unescape(tag["data"] ?? "").replacingOccurrences(of: "\u{E000}", with: "@"))
         case "video":
             guard let file = tag["file"], let data = try? fileSystem.data(file) else { return .done }
             if let media, media.playVideo(data, fileExtension: (file as NSString).pathExtension, finished: { [weak self] in
