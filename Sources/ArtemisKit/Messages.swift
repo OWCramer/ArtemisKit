@@ -5,7 +5,7 @@ import Foundation
 /// Artemis message layers: named text areas (`adv`, `novel`, `name`, ...) chosen with
 /// `[chgmsg id=...]`, laid out by `[font ...]`, filled by prose and `[print]`, cleared by `[rp]`.
 public final class ArtemisMessages {
-    public struct Font: Equatable {
+    public struct Font: Equatable, Codable {
         public var face: String?
         public var left: Double = 0
         public var top: Double = 0
@@ -27,6 +27,13 @@ public final class ArtemisMessages {
         public var font = Font()
         public var text = ""
         public var visible = true
+        /// `[sceout]`: the page is hidden but kept, until `[scein]` (or a new page).
+        public var pageHidden = false
+        /// Characters revealed so far (typewriter); `text.count` when complete.
+        public var revealed: Double = 0
+        /// Milliseconds per character (`[scetween mode=add type=in delay=...]`); 0 = instant.
+        public var charDelay: Double = 30
+        public var isRevealing: Bool { revealed < Double(text.count) }
         /// Bumped whenever the rendered text would change.
         public internal(set) var revision = 0
 
@@ -52,10 +59,26 @@ public final class ArtemisMessages {
 
     public var currentLayer: Layer { layer(current) }
 
+    var stackSnapshot: [String] { stack }
+
+    func resetLayers() {
+        layers.removeAll()
+        stack.removeAll()
+        current = "default"
+        revision += 1
+    }
+
+    func restoreStack(current: String, stack: [String]) {
+        self.current = current
+        self.stack = stack
+        revision += 1
+    }
+
     /// `[chgmsg id=...]` (pushes) and `[/chgmsg]` (pops).
-    public func change(to id: String?) {
+    /// `stack="0"` switches without remembering the previous layer.
+    public func change(to id: String?, push: Bool = true) {
         if let id {
-            stack.append(current)
+            if push { stack.append(current) }
             current = id
             _ = layer(id)
         } else if let previous = stack.popLast() {
@@ -96,10 +119,39 @@ public final class ArtemisMessages {
 
     public func clear(_ id: String? = nil) {
         let layer = id.map(self.layer) ?? currentLayer
-        guard !layer.text.isEmpty else { return }
+        guard !layer.text.isEmpty || layer.pageHidden else { return }
         layer.text = ""
+        layer.revealed = 0
+        layer.pageHidden = false
         touch(layer)
     }
+
+    /// `[sceout]` / `[scein]` on the current layer.
+    public func setPageHidden(_ hidden: Bool) {
+        let layer = currentLayer
+        guard layer.pageHidden != hidden else { return }
+        layer.pageHidden = hidden
+        touch(layer)
+    }
+
+    /// Advances every layer's reveal by `ms`. Returns whether anything is still revealing.
+    @discardableResult
+    func advanceReveal(by ms: Double, instant: Bool) -> Bool {
+        var revealing = false
+        for layer in layers.values where layer.isRevealing {
+            if instant || layer.charDelay <= 0 {
+                layer.revealed = Double(layer.text.count)
+            } else {
+                layer.revealed = min(Double(layer.text.count), layer.revealed + ms / layer.charDelay)
+            }
+            revealing = revealing || layer.isRevealing
+        }
+        return revealing
+    }
+
+    public var isRevealing: Bool { layers.values.contains { $0.isRevealing && $0.visible && !$0.pageHidden } }
+
+    func revealAll() { advanceReveal(by: 0, instant: true) }
 
     private func touch(_ layer: Layer) {
         layer.revision += 1
@@ -139,7 +191,7 @@ public final class ArtemisTextRenderer {
 
     /// Draws `layer`'s text into `context` (top-left origin, stage pixels).
     public func draw(_ layer: ArtemisMessages.Layer, in context: CGContext) {
-        guard layer.visible, !layer.text.isEmpty else { return }
+        guard layer.visible, !layer.pageHidden, !layer.text.isEmpty else { return }
         let spec = layer.font
         let ctFont = font(spec)
         func color(_ rgb: UInt32) -> CGColor {
@@ -185,6 +237,42 @@ public final class ArtemisTextRenderer {
             drawText(attributed(color(spec.outlineColor), strokeWidth: 18, strokeColor: color(spec.outlineColor)), offset: .zero)
         }
         drawText(attributed(color(spec.color), strokeWidth: nil, strokeColor: nil), offset: .zero)
+    }
+
+    /// Rectangles (stage pixels, top-left origin) covering the first `count` characters, for
+    /// revealing text gradually with a mask over a fully drawn line.
+    public func revealRects(for layer: ArtemisMessages.Layer, count: Int) -> [CGRect] {
+        let spec = layer.font
+        let string = NSAttributedString(string: layer.text, attributes: [
+            NSAttributedString.Key(kCTFontAttributeName as String): font(spec),
+            NSAttributedString.Key(kCTKernAttributeName as String): spec.kerning,
+        ])
+        let rect = CGRect(x: spec.left, y: spec.top, width: spec.width, height: spec.height + spec.size)
+        let framesetter = CTFramesetterCreateWithAttributedString(string)
+        let frame = CTFramesetterCreateFrame(framesetter, CFRange(location: 0, length: 0),
+                                             CGPath(rect: CGRect(origin: .zero, size: rect.size), transform: nil), nil)
+        let lines = CTFrameGetLines(frame) as! [CTLine]
+        var origins = [CGPoint](repeating: .zero, count: lines.count)
+        CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
+        let target = (layer.text as NSString).length >= 0 ? utf16Offset(layer.text, characters: count) : 0
+        var rects: [CGRect] = []
+        let lineHeight = spec.size * 1.6
+        for (line, origin) in zip(lines, origins) {
+            let range = CTLineGetStringRange(line)
+            guard range.location < target else { break }
+            let end = min(target, range.location + range.length)
+            let x = end >= range.location + range.length ? CTLineGetTypographicBounds(line, nil, nil, nil)
+                : CTLineGetOffsetForStringIndex(line, end, nil)
+            // CoreText origins are bottom-up within the text rect.
+            let top = rect.minY + (rect.height - origin.y) - spec.size * 1.15
+            rects.append(CGRect(x: rect.minX - 8, y: top - 6, width: x + 16, height: lineHeight + 6))
+        }
+        return rects
+    }
+
+    private func utf16Offset(_ text: String, characters: Int) -> Int {
+        let index = text.index(text.startIndex, offsetBy: min(characters, text.count))
+        return text[..<index].utf16.count
     }
 
     /// The layer's text as a transparent stage-sized image (for presenters that composite).

@@ -162,6 +162,34 @@ static int e_get_script_stack(lua_State *L) {
     return 1;
 }
 
+// e:getMousePoint() -> {x=, y=}
+static int e_get_mouse_point(lua_State *L) {
+    const ArtemisLuaHost *host = host_of(L);
+    double x = 0, y = 0;
+    host->mouse_point(host->context, &x, &y);
+    lua_newtable(L);
+    lua_pushnumber(L, x);
+    lua_setfield(L, -2, "x");
+    lua_pushnumber(L, y);
+    lua_setfield(L, -2, "y");
+    return 1;
+}
+
+// e:setEventHandler{onEnterFrame = "f", onClickWaitIn = "g", ...}
+static int e_set_event_handler(lua_State *L) {
+    luaL_checktype(L, 2, LUA_TTABLE);
+    const ArtemisLuaHost *host = host_of(L);
+    lua_pushnil(L);
+    while (lua_next(L, 2) != 0) {
+        if (lua_type(L, -2) == LUA_TSTRING) {
+            const char *function = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+            host->set_event_handler(host->context, lua_tostring(L, -2), function);
+        }
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
 // Methods Shiori doesn't implement yet: note the call, return nil.
 static int e_unsupported(lua_State *L) {
     const ArtemisLuaHost *host = host_of(L);
@@ -228,6 +256,8 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
         {"include", e_include},
         {"random", e_random},
         {"getScriptStack", e_get_script_stack},
+        {"getMousePoint", e_get_mouse_point},
+        {"setEventHandler", e_set_event_handler},
         {NULL, NULL},
     };
     for (const luaL_Reg *m = methods; m->name; m++) {
@@ -235,7 +265,7 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
         lua_setfield(L, -2, m->name);
     }
     static const char *unsupported[] = {
-        "getScriptBlock", "setEventHandler", "enqueueTag", "setTagFilter", "file", "getMousePoint", NULL,
+        "getScriptBlock", "enqueueTag", "setTagFilter", "file", NULL,
     };
     for (const char **name = unsupported; *name; name++) {
         lua_pushstring(L, *name);

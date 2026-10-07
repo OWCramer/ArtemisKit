@@ -26,12 +26,14 @@ public final class ArtemisFileSystem: @unchecked Sendable {
         let entry: PFSArchive.Entry?
     }
 
+    public let gameRoot: URL
     /// Archives in load order (later ones override earlier ones).
     public let archives: [PFSArchive]
     /// Every visible file, keyed by lowercased path; overridden copies are dropped.
     public let files: [String: File]
 
     public init(gameRoot: URL, patchRoot: URL? = nil) throws {
+        self.gameRoot = gameRoot
         let archives = try Self.archiveURLs(in: gameRoot).map(PFSArchive.init(url:))
         self.archives = archives
 

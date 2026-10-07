@@ -148,13 +148,16 @@ case "snapshot":
     // [stop] takes the next tap (stage pixels); renders the stage when taps run out.
     guard arguments.count >= 3 else { print("snapshot needs an output path"); exit(2) }
     let output = URL(fileURLWithPath: arguments[2])
+    // "x,y" taps; "R" is a right-click.
     var taps = arguments.dropFirst(3).compactMap { pair -> CGPoint? in
+        if pair == "R" { return CGPoint(x: -1, y: -1) }
         let parts = pair.split(separator: ",").compactMap { Double($0) }
         return parts.count == 2 ? CGPoint(x: parts[0], y: parts[1]) : nil
     }
     MainActor.assumeIsolated {
         do {
             let player = try ArtemisPlayer(gameRoot: game)
+            if let saves = ProcessInfo.processInfo.environment["ARTEMIS_SAVES"] { player.savePath = URL(fileURLWithPath: saves) }
             player.onLog = { message in
                 if !message.hasPrefix("debug:") && !message.hasPrefix("lua:") { print("· \(message)") }
             }
@@ -173,16 +176,21 @@ case "snapshot":
                     guard !taps.isEmpty else { break loop }
                     let tap = taps.removeFirst()
                     print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
-                    player.tap(at: tap)
+                    if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
                 case .video:
                     player.videoFinished()
+                case .dialog:
+                    break loop
                 case .none:
                     break loop
                 }
                 if player.failure != nil { break loop }
             }
             print("stopped: \(player.wait) at \(player.interpreter.location), t=\(Int(time)) ms")
-            if !player.messageText.isEmpty { print("text: \(player.messageText.prefix(300))") }
+            print("message layer: \(player.messages.current)")
+            for layer in player.messages.layers.values where !layer.text.isEmpty {
+                print("  ~\(layer.id)\(layer.pageHidden ? " (hidden)" : ""): \(layer.text.prefix(120).replacingOccurrences(of: "\n", with: " / "))")
+            }
             func dump(_ layer: ArtemisLayer, _ depth: Int) {
                 print(String(repeating: "  ", count: depth) + "\(layer.id) \(layer.file ?? (layer.color.map { String($0, radix: 16) } ?? "-")) \(Int(layer.width))x\(Int(layer.height)) @\(Int(layer.left)),\(Int(layer.top)) a=\(Int(layer.alpha)) s=\(Int(layer.xscale)) v=\(layer.visible) img=\(layer.image != nil)")
                 layer.children.forEach { dump($0, depth + 1) }

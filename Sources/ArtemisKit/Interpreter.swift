@@ -1,4 +1,5 @@
 import CLua
+import CoreGraphics
 import Foundation
 
 /// A tag ready for the host: attribute expressions evaluated.
@@ -60,7 +61,15 @@ public final class ArtemisInterpreter {
         var isMacro: Bool
         /// Set for calls made from Lua: running stops when this frame returns.
         var barrier = false
+        /// An event that interrupted a wait (a button during a text wait, right-click):
+        /// returning from it hands the wait back to the host.
+        var interrupt = false
+        /// The right-click script's frame (a second right-click unwinds to its *leave).
+        var rightClick = false
     }
+
+    /// Reported as the waiting reason when an interrupt returns.
+    public static let interruptReturned = "interrupt-returned"
 
     public let fileSystem: ArtemisFileSystem
     public weak var host: ArtemisHost?
@@ -259,12 +268,41 @@ public final class ArtemisInterpreter {
         return ArtemisTag(name: name, attributes: attributes, order: order)
     }
 
+    /// Evaluates an expression. Malformed ones (games ship a few, e.g. a missing `+`) are
+    /// logged once and read as empty, rather than stopping the game.
     public func expression(_ source: String) throws -> ArtemisValue {
-        try ArtemisExpression.evaluate(source) { self.value(of: $0) }
+        do {
+            return try ArtemisExpression.evaluate(source) { self.value(of: $0) }
+        } catch {
+            if reportedUnhandled.insert("expr:" + source).inserted {
+                host?.log("bad expression at \(location) (read as empty): \(error)")
+            }
+            return .string("")
+        }
     }
 
     /// A variable as scripts see it: the innermost macro's attributes first.
+    /// The last pointer/touch position (stage pixels), for `e:getMousePoint()`.
+    public var pointer = CGPoint.zero
+    /// Lua functions set with `e:setEventHandler` (onEnterFrame, onClickWaitIn, ...).
+    public private(set) var luaEventHandlers: [String: String] = [:]
+
+    /// Calls a Lua event handler, if set (errors are logged).
+    public func callLuaEvent(_ event: String) {
+        guard let function = luaEventHandlers[event] else { return }
+        do {
+            try callLua(ArtemisTag(name: "calllua", attributes: ["function": function], order: ["function"]))
+        } catch {
+            host?.log("lua \(event) (\(function)): \(error)")
+            luaEventHandlers[event] = nil
+        }
+    }
+
+    /// Read-only system variables the engine provides (`s.current_message_layer`, ...).
+    public var systemVariable: ((String) -> String?)?
+
     public func value(of name: String) -> String? {
+        if name.hasPrefix("s."), let value = systemVariable?(name) { return value }
         for frame in frames.reversed() {
             if let local = frame.locals[name] { return local }
             if frame.isMacro { break }
@@ -356,20 +394,64 @@ public final class ArtemisInterpreter {
         let finished = frames.removeLast()
         if frames.isEmpty { state = .finished }
         if finished.barrier { barrierReached = true }
+        if finished.interrupt, !frames.isEmpty { state = .waiting(Self.interruptReturned) }
     }
+
+    // MARK: Save state
+
+    func savedFrames(upTo limit: Int? = nil) -> [ArtemisSaveState.Frame] {
+        frames.prefix(limit ?? frames.count).map {
+            .init(file: $0.script.path, pc: $0.pc, locals: $0.locals, isMacro: $0.isMacro,
+                  interrupt: $0.interrupt, rightClick: $0.rightClick)
+        }
+    }
+
+    /// Index of the first interrupt frame (a button or the right-click menu), if any.
+    var firstInterruptIndex: Int? { frames.firstIndex { $0.interrupt } }
+
+    func restore(frames saved: [ArtemisSaveState.Frame]) throws {
+        frames = try saved.map {
+            Frame(script: try script($0.file), pc: $0.pc, locals: $0.locals, isMacro: $0.isMacro,
+                  interrupt: $0.interrupt, rightClick: $0.rightClick)
+        }
+        state = .waiting("loaded")
+    }
+
+    /// Right-click (`[rclick]`): runs the right-click script as an interrupt; inside it, a
+    /// second right-click unwinds its calls and goes to its `*leave` label.
+    public func rightClick(file: String) throws {
+        if let index = frames.lastIndex(where: { $0.rightClick }) {
+            frames.removeSubrange((index + 1)...)
+            let script = frames[index].script
+            frames[index].pc = script.labels["leave"] ?? script.commands.count
+        } else {
+            let script = try script(file)
+            frames.append(Frame(script: script, pc: 0, locals: [:], isMacro: false, interrupt: true, rightClick: true))
+        }
+        state = .running
+    }
+
+    public var inRightClickScript: Bool { frames.contains { $0.rightClick } }
 
     private var barrierReached = false
 
     /// A layer event fired while the script waits (a button press at `[stop]`): runs the
     /// event's `handler` tag first, then calls (`call="1"`, coming back to the wait) or
     /// jumps to its `file`/`label`.
-    public func fireEvent(_ attributes: [String: String]) throws {
+    /// With `interrupt`, the event fired during a wait that isn't a [stop] (a text wait):
+    /// a call returns to that wait instead of re-running a command.
+    public func fireEvent(_ attributes: [String: String], interrupt: Bool = false) throws {
         let file = attributes["file"], label = attributes["label"]
         if file != nil || label != nil {
             if attributes["call"] == "1" {
-                // Re-run the waiting command (usually [stop]) after the call returns.
-                frames[frames.count - 1].pc = max(0, frames[frames.count - 1].pc - 1)
-                try call(file: file, label: label, locals: [:], isMacro: false)
+                if interrupt {
+                    let (script, index) = try target(file: file, label: label)
+                    frames.append(Frame(script: script, pc: index, locals: [:], isMacro: false, interrupt: true))
+                } else {
+                    // Re-run the waiting command (usually [stop]) after the call returns.
+                    frames[frames.count - 1].pc = max(0, frames[frames.count - 1].pc - 1)
+                    try call(file: file, label: label, locals: [:], isMacro: false)
+                }
             } else {
                 try jump(file: file, label: label)
             }
@@ -445,8 +527,11 @@ public final class ArtemisInterpreter {
         case "var_exist":
             let target = tag["target"] ?? tag["data"] ?? ""
             return value(of: target) != nil ? "1" : "0"
-        case "file_exist":
-            return fileSystem.file(tag["file"] ?? "") != nil ? "1" : "0"
+        case "file_exist", "file_exists":
+            let file = tag["file"] ?? ""
+            // Game files, or (absolute) save files and thumbnails on disk.
+            let exists = fileSystem.file(file) != nil || (file.hasPrefix("/") && FileManager.default.fileExists(atPath: file))
+            return exists ? "1" : "0"
         case "os":
             return "iphone"
         case "length":
@@ -536,6 +621,17 @@ public final class ArtemisInterpreter {
                 let name = "e:" + String(cString: method!)
                 if interpreter.reportedUnhandled.insert(name).inserted { interpreter.host?.log("unsupported \(name) at \(interpreter.location)") }
             }
+        }
+        luaHost.mouse_point = { context, x, y in
+            let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
+            let point = MainActor.assumeIsolated { interpreter.pointer }
+            x?.pointee = point.x
+            y?.pointee = point.y
+        }
+        luaHost.set_event_handler = { context, event, function in
+            let interpreter = Unmanaged<ArtemisInterpreter>.fromOpaque(context!).takeUnretainedValue()
+            let name = String(cString: event!), value = luaString(function!)
+            MainActor.assumeIsolated { interpreter.luaEventHandlers[name] = value.isEmpty ? nil : value }
         }
         lua = withUnsafePointer(to: &luaHost) { artemis_lua_open($0) }
         artemis_lua_set_number(lua, "sc_width", Double(stageWidth))

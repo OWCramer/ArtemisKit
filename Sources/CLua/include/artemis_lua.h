@@ -19,6 +19,10 @@ typedef struct ArtemisLuaHost {
     char *(*script_stack)(void *context);
     /// A method of `e` Shiori doesn't implement yet was called.
     void (*unsupported)(void *context, const char *method);
+    /// e:getMousePoint(): the last pointer/touch position in stage pixels.
+    void (*mouse_point)(void *context, double *x, double *y);
+    /// e:setEventHandler{event = "function"}: "" clears.
+    void (*set_event_handler)(void *context, const char *event, const char *function);
 } ArtemisLuaHost;
 
 /// A Lua 5.1 state with the standard libraries, `e`, and the archive-backed io.open.

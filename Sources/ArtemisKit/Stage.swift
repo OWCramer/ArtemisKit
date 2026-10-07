@@ -32,8 +32,15 @@ public final class ArtemisLayer {
         self.id = id
     }
 
-    var sortKey: [Double] {
-        id.split(separator: ".", omittingEmptySubsequences: false).map { Double($0) ?? -.greatestFiniteMagnitude }
+    /// Siblings draw in id order: numeric ids numerically, anything else as strings
+    /// (Artemis spec, layer.txt). Compares the last path component.
+    static func drawsBefore(_ a: ArtemisLayer, _ b: ArtemisLayer) -> Bool {
+        let x = a.id.split(separator: ".", omittingEmptySubsequences: false).last.map(String.init) ?? ""
+        let y = b.id.split(separator: ".", omittingEmptySubsequences: false).last.map(String.init) ?? ""
+        let xNumeric = !x.isEmpty && x.allSatisfy(\.isASCII) && x.allSatisfy(\.isNumber)
+        let yNumeric = !y.isEmpty && y.allSatisfy(\.isASCII) && y.allSatisfy(\.isNumber)
+        if xNumeric, yNumeric { return (Double(x) ?? 0) < (Double(y) ?? 0) }
+        return x < y
     }
 
     public var effectiveAnchorX: Double { anchorX ?? width / 2 }
@@ -176,7 +183,7 @@ public final class ArtemisStage {
             } else {
                 let child = ArtemisLayer(id: path)
                 current.children.append(child)
-                current.children.sort { $0.sortKey.lexicographicallyPrecedes($1.sortKey) }
+                current.children.sort(by: ArtemisLayer.drawsBefore)
                 current = child
             }
         }
@@ -272,8 +279,13 @@ public final class ArtemisStage {
         tweens.removeAll { $0.layer == id && (property == nil || $0.property == property) }
     }
 
+    /// Bumped whenever a tween moved or finished: animated layers show immediately (the
+    /// engine animates the visible screen), so presenters resync then.
+    public private(set) var tweenRevision = 0
+
     /// Advances tweens to `time` (ms). Finished ones land on their end value.
     public func update(time: Double) {
+        if !tweens.isEmpty { tweenRevision += 1 }
         var remaining: [ArtemisTween] = []
         for tween in tweens {
             guard let layer = layer(tween.layer) else { continue }
@@ -319,11 +331,44 @@ public final class ArtemisStage {
             } else {
                 events[id]?[type]?.enabled = on
             }
-        case "delete":
+        case "reset", "delete":
             events[id]?[type] = nil
         default:
             break
         }
+    }
+
+    func savedEvents() -> [String: [String: [String: String]]] {
+        events.mapValues { $0.mapValues { event in
+            var attributes = event.attributes
+            attributes["__enabled"] = event.enabled ? "1" : "0"
+            return attributes
+        } }
+    }
+
+    func restoreEvents(_ saved: [String: [String: [String: String]]]) {
+        events = saved.mapValues { $0.mapValues { attributes in
+            var attributes = attributes
+            let enabled = attributes.removeValue(forKey: "__enabled") != "0"
+            return ArtemisLayerEvent(attributes: attributes, enabled: enabled)
+        } }
+        tweens.removeAll()
+    }
+
+    /// The topmost visible layer with an enabled event of `type` under `point`.
+    public func eventTarget(at point: CGPoint, type: String) -> String? {
+        var result: String?
+        func visit(_ layer: ArtemisLayer, _ transform: CGAffineTransform) {
+            guard layer.visible else { return }
+            let combined = layer.transform.concatenating(transform)
+            if let event = events[layer.id]?[type], event.enabled {
+                let local = point.applying(combined.inverted())
+                if local.x >= 0, local.y >= 0, local.x < layer.width, local.y < layer.height { result = layer.id }
+            }
+            for child in layer.children { visit(child, combined) }
+        }
+        for child in root.children { visit(child, .identity) }
+        return result
     }
 
     /// The topmost visible layer with an enabled click event under `point` (stage pixels).
