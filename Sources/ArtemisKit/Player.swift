@@ -197,6 +197,11 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// Boots the game's BOOT script and runs to the first wait.
     public func start() throws {
+        // The engine's writable system variables start at its defaults (saved values win).
+        for (name, value) in ["s.bgmvol": "1000", "s.sevol": "1000", "s.videovol": "1000", "s.automodewait": "2000"]
+        where interpreter.variables[name] == nil {
+            interpreter.variables[name] = value
+        }
         loadGlobals()
         try interpreter.boot(Self.bootScript(fileSystem))
         runInterpreter()
@@ -1404,7 +1409,7 @@ public final class ArtemisPlayer: ArtemisHost {
     /// `[reset]`: the engine restarts from the boot script, keeping only `g.` variables.
     private func resetEngine() {
         saveGlobals()
-        let globals = interpreter.variables.filter { $0.key.hasPrefix("g.") }
+        let globals = interpreter.variables.filter { Self.isPersistent($0.key) }
         stage.deleteLayer("")
         stage.present(transition: nil)
         messages.restore([], current: "default", stack: [], defaultFont: ArtemisMessages.Font())
@@ -1452,7 +1457,7 @@ public final class ArtemisPlayer: ArtemisHost {
         let (messageLayers, current, stack, defaultFont) = messages.saved()
         return ArtemisSaveState(
             frames: interpreter.savedFrames(upTo: limit),
-            variables: interpreter.variables.filter { !$0.key.hasPrefix("t.") && !$0.key.hasPrefix("g.") },
+            variables: interpreter.variables.filter { !$0.key.hasPrefix("t.") && !Self.isPersistent($0.key) },
             layers: stage.savedLayers(), events: stage.savedEvents(),
             messages: messageLayers, currentMessage: current, messageStack: stack, defaultFont: defaultFont,
             wait: waitName(wait), pendingText: pendingText, keyHandlers: keyHandlers,
@@ -1493,7 +1498,7 @@ public final class ArtemisPlayer: ArtemisHost {
             record("load failed: \(error)")
             return false
         }
-        let globals = interpreter.variables.filter { $0.key.hasPrefix("g.") }
+        let globals = interpreter.variables.filter { Self.isPersistent($0.key) }
         interpreter.variables = state.variables.merging(globals) { _, global in global }
         stage.restore(layers: state.layers, events: state.events)
         messages.restore(state.messages, current: state.currentMessage, stack: state.messageStack, defaultFont: state.defaultFont)
@@ -1536,9 +1541,16 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     /// Writes `g.` variables (they live outside save slots). Call when leaving the game too.
+    /// Kept between sessions: `g.` variables, and the system variables the engine keeps
+    /// in its system.dat (volumes, auto speed).
+    static func isPersistent(_ name: String) -> Bool {
+        name.hasPrefix("g.") || ["s.bgmvol", "s.sevol", "s.videovol", "s.automodewait"].contains(name)
+            || name.hasPrefix("s.segain.")
+    }
+
     public func saveGlobals() {
         try? JSONEncoder().encode(Array(readPositions).sorted()).write(to: resolveSavePath("read.json"), options: .atomic)
-        let globals = interpreter.variables.filter { $0.key.hasPrefix("g.") }
+        let globals = interpreter.variables.filter { Self.isPersistent($0.key) }
         try? FileManager.default.createDirectory(at: globalsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? JSONEncoder().encode(globals).write(to: globalsURL, options: .atomic)
     }
