@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import Foundation
 import ImageIO
 
@@ -29,6 +30,78 @@ public final class ArtemisLayer {
     public var file: String?
     /// A video layer's decoder (`[video id=...]`); its frames become `image`.
     public var video: ArtemisVideo?
+    /// `reversex` / `reversey`: mirrored around the anchor.
+    public var reverseX = false
+    public var reverseY = false
+    /// `clip`: the part of the image shown (image pixels); width/height follow it.
+    public var clip: CGRect?
+    /// `layermode`: normal, add, screen or multiply.
+    public var blendMode = "normal"
+    /// `negative`, `grayscale`, `colormultiply` (0xFFFFFF = none), `lyc mask=`.
+    public var negative = false
+    public var grayscale = false
+    public var colorMultiply: UInt32 = 0xFFFFFF
+    public var mask: CGImage?
+    /// `clickablethreshold`: events fire only where the image's alpha reaches this.
+    public var clickThreshold: Double?
+    /// `draggable` / `dragarea` (left, top, right, bottom the layer stays within).
+    public var draggable = false
+    public var dragArea: CGRect?
+
+    /// The image as shown: mask and colour effects applied (cached).
+    public var displayImage: CGImage? {
+        guard let image else { return nil }
+        guard negative || grayscale || colorMultiply != 0xFFFFFF || mask != nil else { return image }
+        let key = "\(ObjectIdentifier(image))|\(negative)|\(grayscale)|\(colorMultiply)|\(mask.map { "\(ObjectIdentifier($0))" } ?? "-")"
+        if key == processedKey, let processed { return processed }
+        processed = ArtemisLayer.process(image, negative: negative, grayscale: grayscale, multiply: colorMultiply, mask: mask)
+        processedKey = key
+        return processed
+    }
+    private var processed: CGImage?
+    private var processedKey: String?
+
+    nonisolated(unsafe) private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+
+    static func process(_ image: CGImage, negative: Bool, grayscale: Bool, multiply: UInt32, mask: CGImage?) -> CGImage? {
+        var output = CIImage(cgImage: image)
+        let extent = output.extent
+        if grayscale {
+            output = output.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
+        }
+        if negative {
+            output = output.applyingFilter("CIColorInvert")
+        }
+        if multiply != 0xFFFFFF {
+            let r = CGFloat((multiply >> 16) & 0xFF) / 255, g = CGFloat((multiply >> 8) & 0xFF) / 255, b = CGFloat(multiply & 0xFF) / 255
+            output = output.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: r, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: g, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: b, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            ])
+        }
+        if let mask {
+            // White in the mask is opaque, black transparent.
+            let maskImage = CIImage(cgImage: mask).transformed(by: CGAffineTransform(scaleX: extent.width / CGFloat(mask.width),
+                                                                                    y: extent.height / CGFloat(mask.height)))
+            output = output.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: maskImage,
+            ])
+        }
+        return ciContext.createCGImage(output.cropped(to: extent), from: extent)
+    }
+
+    /// Alpha (0...255) of the shown image at a point in layer pixels; 255 for colour layers.
+    func alpha(at point: CGPoint) -> Double {
+        guard let image = displayImage else { return 255 }
+        let x = Int(point.x + (clip?.minX ?? 0)), y = Int(point.y + (clip?.minY ?? 0))
+        guard x >= 0, y >= 0, x < image.width, y < image.height else { return 0 }
+        var pixel: [UInt8] = [0, 0, 0, 0]
+        guard let context = CGContext(data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return 255 }
+        context.draw(image, in: CGRect(x: -x, y: y - image.height + 1, width: image.width, height: image.height))
+        return Double(pixel[3])
+    }
 
     init(id: String) {
         self.id = id
@@ -53,7 +126,7 @@ public final class ArtemisLayer {
         let ax = effectiveAnchorX, ay = effectiveAnchorY
         return CGAffineTransform(translationX: left + ax, y: top + ay)
             .rotated(by: rotate * .pi / 180)
-            .scaledBy(x: xscale / 100, y: yscale / 100)
+            .scaledBy(x: xscale / 100 * (reverseX ? -1 : 1), y: yscale / 100 * (reverseY ? -1 : 1))
             .translatedBy(x: -ax, y: -ay)
     }
 
@@ -82,6 +155,8 @@ public final class ArtemisLayer {
         case "anchorx": anchorX = value
         case "anchory": anchorY = value
         case "visible": visible = value != 0
+        case "reversex": reverseX = value != 0
+        case "reversey": reverseY = value != 0
         default: break
         }
     }
@@ -251,6 +326,10 @@ public final class ArtemisStage {
         layer.left = 0; layer.top = 0; layer.alpha = 255; layer.xscale = 100; layer.yscale = 100
         layer.rotate = 0; layer.anchorX = nil; layer.anchorY = nil; layer.visible = true
         layer.image = nil; layer.color = nil; layer.file = nil; layer.video = nil
+        layer.reverseX = false; layer.reverseY = false; layer.clip = nil; layer.blendMode = "normal"
+        layer.negative = false; layer.grayscale = false; layer.colorMultiply = 0xFFFFFF; layer.mask = nil
+        layer.clickThreshold = nil; layer.draggable = false; layer.dragArea = nil
+        if let mask = tag["mask"], !mask.isEmpty { layer.mask = image(mask) }
         tweens.removeAll { $0.layer == id }
         if let file = tag["file"], !file.isEmpty {
             layer.file = file
@@ -286,6 +365,10 @@ public final class ArtemisStage {
         videoRevision += 1
     }
 
+    /// While skipping, video layers hold their picture (decoding frames nobody sees would
+    /// cost more than the skip); they pick up again afterwards.
+    public var holdsVideoFrames = false
+
     /// Ids of layers that have had a video; pruned as they go.
     private var videoLayers: Set<String> = []
     /// Bumped when a video layer shows a new frame.
@@ -306,7 +389,27 @@ public final class ArtemisStage {
     }
 
     private func apply(properties tag: ArtemisTag, to layer: ArtemisLayer) {
-        for key in ["left", "top", "alpha", "xscale", "yscale", "rotate", "anchorx", "anchory", "visible"] {
+        func numbers(_ key: String) -> [Double]? {
+            tag[key].map { $0.split(separator: ",").compactMap { ArtemisValue.number(from: String($0)) } }
+        }
+        if let clip = numbers("clip") {
+            if clip.count == 4 {
+                layer.clip = CGRect(x: clip[0], y: clip[1], width: clip[2], height: clip[3])
+                layer.width = clip[2]
+                layer.height = clip[3]
+            } else {
+                layer.clip = nil
+                if let image = layer.image { layer.width = Double(image.width); layer.height = Double(image.height) }
+            }
+        }
+        if let mode = tag["layermode"] { layer.blendMode = mode.lowercased() }
+        if let value = tag["negative"] { layer.negative = value == "1" }
+        if let value = tag["grayscale"] { layer.grayscale = value == "1" }
+        if let value = tag["colormultiply"] { layer.colorMultiply = ArtemisMessages.rgb(value) & 0xFFFFFF }
+        if let value = tag["clickablethreshold"] { layer.clickThreshold = ArtemisValue.number(from: value) }
+        if let value = tag["draggable"] { layer.draggable = value == "1" }
+        if let area = numbers("dragarea") { layer.dragArea = area.count == 4 ? CGRect(x: area[0], y: area[1], width: area[2] - area[0], height: area[3] - area[1]) : nil }
+        for key in ["left", "top", "alpha", "xscale", "yscale", "rotate", "anchorx", "anchory", "visible", "reversex", "reversey"] {
             if let value = tag[key], let number = ArtemisValue.number(from: value) {
                 layer.setProperty(key, number)
                 // An explicit set stops tweens on that property.
@@ -373,7 +476,7 @@ public final class ArtemisStage {
     /// Advances tweens to `time` (ms). Finished ones land on their end value.
     public func update(time: Double) {
         clock = time
-        for id in videoLayers {
+        for id in videoLayers where !holdsVideoFrames {
             guard let layer = layer(id), let video = layer.video else {
                 videoLayers.remove(id)
                 continue
@@ -476,12 +579,43 @@ public final class ArtemisStage {
             let combined = layer.transform.concatenating(transform)
             if let event = events[layer.id]?[type], event.enabled {
                 let local = point.applying(combined.inverted())
-                if local.x >= 0, local.y >= 0, local.x < layer.width, local.y < layer.height { result = layer.id }
+                if hits(layer, local) { result = layer.id }
             }
             for child in layer.children { visit(child, combined) }
         }
         for child in root.children { visit(child, .identity) }
         return result
+    }
+
+    private func hits(_ layer: ArtemisLayer, _ local: CGPoint) -> Bool {
+        guard local.x >= 0, local.y >= 0, local.x < layer.width, local.y < layer.height else { return false }
+        if let threshold = layer.clickThreshold { return layer.alpha(at: local) >= threshold }
+        return true
+    }
+
+    /// The topmost visible draggable layer under `point` (`lyprop draggable=1`).
+    public func draggableLayer(at point: CGPoint) -> ArtemisLayer? {
+        var result: ArtemisLayer?
+        func visit(_ layer: ArtemisLayer, _ transform: CGAffineTransform) {
+            guard layer.visible else { return }
+            let combined = layer.transform.concatenating(transform)
+            if layer.draggable, hits(layer, point.applying(combined.inverted())) { result = layer }
+            for child in layer.children { visit(child, combined) }
+        }
+        for child in root.children { visit(child, .identity) }
+        return result
+    }
+
+    /// Moves a dragged layer by a stage-pixel delta, kept inside its drag area; the screen
+    /// follows at once.
+    public func drag(_ layer: ArtemisLayer, by delta: CGSize) {
+        layer.left += delta.width
+        layer.top += delta.height
+        if let area = layer.dragArea {
+            layer.left = min(max(layer.left, area.minX), max(area.minX, area.maxX - layer.width))
+            layer.top = min(max(layer.top, area.minY), max(area.minY, area.maxY - layer.height))
+        }
+        tweenRevision += 1
     }
 
     /// The topmost visible layer with an enabled click event under `point` (stage pixels).
@@ -493,7 +627,7 @@ public final class ArtemisStage {
             let alpha = opacity * layer.alpha / 255
             if let event = events[layer.id]?["click"], event.enabled, alpha > 0 || events[layer.id]?["click"] != nil {
                 let local = point.applying(combined.inverted())
-                if local.x >= 0, local.y >= 0, local.x < layer.width, local.y < layer.height { result = (layer.id, event) }
+                if hits(layer, local) { result = (layer.id, event) }
             }
             for child in layer.children { visit(child, combined, alpha) }
         }
@@ -520,6 +654,15 @@ public final class ArtemisStage {
             ]
             for (name, value) in fields { result["\(key).\(name)"] = ArtemisValue.format(value) }
             result["\(key).id"] = layer.id
+            result["\(key).reversex"] = layer.reverseX ? "1" : "0"
+            result["\(key).reversey"] = layer.reverseY ? "1" : "0"
+            if let image = layer.image {
+                result["\(key).surfacewidth"] = String(image.width)
+                result["\(key).surfaceheight"] = String(image.height)
+            }
+            if let clip = layer.clip {
+                result["\(key).clip"] = [clip.minX, clip.minY, clip.width, clip.height].map(ArtemisValue.format).joined(separator: ",")
+            }
         }
         result["size"] = String(all.count)
         return result
@@ -551,11 +694,20 @@ public final class ArtemisStage {
                 context.setFillColor(CGColor(red: r, green: g, blue: b, alpha: a))
                 context.fill(rect)
             }
-            if let image = layer.image {
+            if let image = layer.displayImage {
                 context.saveGState()
-                context.translateBy(x: 0, y: rect.height)
+                switch layer.blendMode {
+                case "add": context.setBlendMode(.plusLighter)
+                case "screen": context.setBlendMode(.screen)
+                case "multiply": context.setBlendMode(.multiply)
+                default: break
+                }
+                context.clip(to: rect)
+                let clip = layer.clip ?? rect
+                let full = CGRect(x: -clip.minX, y: -clip.minY, width: Double(image.width), height: Double(image.height))
+                context.translateBy(x: 0, y: full.height + 2 * full.minY)
                 context.scaleBy(x: 1, y: -1)
-                context.draw(image, in: rect)
+                context.draw(image, in: full)
                 context.restoreGState()
             }
             for child in layer.children { draw(child, opacity: alpha) }

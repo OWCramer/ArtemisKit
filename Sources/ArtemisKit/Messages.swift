@@ -113,6 +113,10 @@ public final class ArtemisMessages {
         /// Link the text being written belongs to (`[link]` ... `[/link]`).
         var activeLink: Int?
         public var visible = true
+        /// `[lyprop id="~<layer>"]`: the page moved and faded as a whole.
+        public var offsetX: Double = 0
+        public var offsetY: Double = 0
+        public var alpha: Double = 255
         /// `[sceout]`: the page is hidden but kept, until `[scein]` (or a new page).
         public var pageHidden = false
         /// Characters revealed so far (typewriter); `text.count` when complete.
@@ -508,13 +512,14 @@ public final class ArtemisTextRenderer {
             let line = CTTypesetterCreateLineWithOffset(typesetter, range, 0)
             // Trailing newlines and spaces don't count towards alignment.
             let width = CTLineGetTypographicBounds(line, nil, nil, nil) - CTLineGetTrailingWhitespaceWidth(line)
-            let x: Double
+            var x: Double
             switch spec.align {
             case "center": x = spec.left + (spec.width - width) / 2
             case "right": x = spec.left + spec.width - width
             default: x = spec.left + offset
             }
-            let top = spec.top + Double(index) * pitch
+            x += layer.offsetX
+            let top = spec.top + layer.offsetY + Double(index) * pitch
             let textTop = top + spec.spaceTop + spec.rubySize + spec.lineSpacing
             lines.append(Line(line: line, x: x, top: top, pitch: pitch, baseline: textTop + ascent, range: range, width: width))
             // The closing bracket ends the hanging indent.
@@ -527,7 +532,10 @@ public final class ArtemisTextRenderer {
 
     /// Draws `layer`'s text into `context` (top-left origin, stage pixels).
     public func draw(_ layer: ArtemisMessages.Layer, in context: CGContext) {
-        guard layer.visible, !layer.pageHidden, !layer.runs.isEmpty else { return }
+        guard layer.visible, !layer.pageHidden, !layer.runs.isEmpty, layer.alpha > 0 else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.setAlpha(layer.alpha / 255)
         let lines = layout(layer, string: attributed(layer, pass: .measure))
         func pass(_ pass: Pass, offset: Double) {
             let string = attributed(layer, pass: pass)
@@ -605,7 +613,7 @@ public final class ArtemisTextRenderer {
         guard !layer.runs.isEmpty else { return (0, 0, 0) }
         let lines = layout(layer, string: attributed(layer, pass: .measure))
         let width = lines.map(\.width).max() ?? 0
-        let height = lines.last.map { $0.top + $0.pitch - layer.layoutFont.top } ?? 0
+        let height = lines.last.map { $0.top + $0.pitch - layer.layoutFont.top - layer.offsetY } ?? 0
         return (width, height, lines.last?.width ?? 0)
     }
 

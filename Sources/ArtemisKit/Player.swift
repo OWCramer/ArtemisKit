@@ -241,6 +241,7 @@ public final class ArtemisPlayer: ArtemisHost {
         frameNumber += 1
         frameEdges = pendingEdges
         pendingEdges = [:]
+        stage.holdsVideoFrames = skipMode
         stage.update(time: time)
         // Tween completion handlers (a choice's time limit) run like layer events, once
         // the script is waiting on buttons.
@@ -404,16 +405,33 @@ public final class ArtemisPlayer: ArtemisHost {
         switch phase {
         case .began:
             dragLayer = stage.eventTarget(at: point, type: "dragin") ?? stage.eventTarget(at: point, type: "drag")
+            draggedLayer = stage.draggableLayer(at: point)
+            lastDragPoint = point
             fireDrag("dragin")
         case .moved:
+            if let layer = draggedLayer, let last = lastDragPoint {
+                stage.drag(layer, by: CGSize(width: point.x - last.x, height: point.y - last.y))
+            }
+            lastDragPoint = point
             fireDrag("drag")
         case .ended:
             fireDrag("dragout")
             dragLayer = nil
+            draggedLayer = nil
+            lastDragPoint = nil
         }
     }
 
     private var dragLayer: String?
+    /// A `draggable` layer following the finger.
+    private var draggedLayer: ArtemisLayer?
+    private var lastDragPoint: CGPoint?
+
+    /// Whether a drag starting here would move something (sliders, draggable layers).
+    public func canDrag(at point: CGPoint) -> Bool {
+        wait == .stop && (stage.eventTarget(at: point, type: "dragin") ?? stage.eventTarget(at: point, type: "drag")) != nil
+            || stage.draggableLayer(at: point) != nil
+    }
 
     private func fireDrag(_ type: String) {
         guard wait == .stop, let id = dragLayer, let event = stage.events[id]?[type], event.enabled else { return }
@@ -768,7 +786,21 @@ public final class ArtemisPlayer: ArtemisHost {
         case "lyc":
             stage.create(tag)
         case "lyprop":
-            stage.setProperties(tag)
+            if let id = tag["id"], id.hasPrefix("~") {
+                // A message layer ("~" alone is the default one).
+                let layer = messages.layer(id == "~" ? "default" : String(id.dropFirst()))
+                layer.offsetX = tag.number("left", default: layer.offsetX)
+                layer.offsetY = tag.number("top", default: layer.offsetY)
+                layer.alpha = max(0, min(255, tag.number("alpha", default: layer.alpha)))
+                if let visible = tag["visible"] { layer.visible = visible != "0" }
+                messages.touch(layer)
+            } else if tag["id"] == "!" {
+                var attributes = tag.attributes
+                attributes["id"] = ""
+                stage.setProperties(ArtemisTag(name: "lyprop", attributes: attributes, order: tag.order))
+            } else {
+                stage.setProperties(tag)
+            }
         case "lydel":
             stage.deleteLayer(tag["id"] ?? "")
         case "lytween":
@@ -1051,6 +1083,7 @@ public final class ArtemisPlayer: ArtemisHost {
         case "glyph":
             glyph = (tag["layer"], tag["rplayer"], tag.number("left"), tag.number("top"),
                      tag.number("rpleft"), tag.number("rptop"), tag["homing"] == "1")
+            lastGlyphState = ""
             updateGlyph()
         case "print":
             messages.append(Self.unescape(tag["data"] ?? "").replacingOccurrences(of: "\u{E000}", with: "@"))
@@ -1125,12 +1158,17 @@ public final class ArtemisPlayer: ArtemisHost {
     // MARK: Click-wait glyph
 
     /// `[glyph]`: line-end and page-end glyph layers, offsets, and whether they follow the text.
+    private var lastGlyphState = ""
     private var glyph: (layer: String?, pageLayer: String?, left: Double, top: Double, pageLeft: Double, pageTop: Double, homing: Bool)?
 
     /// Shows the glyph at a click wait (at the end of the text when homing) and hides it
     /// otherwise; the page-end glyph when the wait ends the page.
     private func updateGlyph() {
         guard let glyph else { return }
+        // Only when the wait or the text changed (layout is not free).
+        let state = "\(wait)|\(messages.revision)|\(messages.current)"
+        guard state != lastGlyphState else { return }
+        lastGlyphState = state
         let atPageEnd = wait == .click && pendingText == nil && interpreter.nextTagName == "rp"
         let active = (atPageEnd ? glyph.pageLayer : nil) ?? glyph.layer
         for id in [glyph.layer, glyph.pageLayer].compactMap({ $0 }) {

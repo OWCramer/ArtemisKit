@@ -142,6 +142,12 @@ public final class ArtemisVideo {
         guard !isFinished else { return false }
         if startTime == nil { startTime = time }
         var target = Int(((time - startTime!) * frameRate / 1000).rounded(.down))
+        // Far behind (the clock jumped: skip mode, a paused app): carry on from the next
+        // frame instead of decoding everything in between.
+        if target - framesDecoded > Int(frameRate) {
+            startTime = time - Double(framesDecoded) * 1000 / frameRate
+            target = framesDecoded
+        }
         var planes: ShioriPlanes?
         // Decode up to the frame due now; only the last one is converted.
         while framesDecoded <= target {

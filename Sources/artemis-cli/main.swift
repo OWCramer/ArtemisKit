@@ -202,7 +202,7 @@ case "snapshot":
                     // In skip mode taps answer [stop]s (choices, menus); clicks are skipped.
                     if player.wait == .click, ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil {
                         if ProcessInfo.processInfo.environment["ARTEMIS_SKIP_TRACE"] != nil { print("skip re-enabled at \(player.interpreter.location)") }
-                        player.setSkipMode(true)
+                        player.setSkipMode(true, force: true)
                         continue
                     }
                     guard !taps.isEmpty else { break loop }
@@ -210,7 +210,7 @@ case "snapshot":
                     print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
                     if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
                     // ARTEMIS_SKIP=1: skip mode after each tap (it stops at choices).
-                    if ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil { player.setSkipMode(true) }
+                    if ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil { player.setSkipMode(true, force: true) }
                 case .video:
                     player.videoFinished()
                 case .videoLayer:
