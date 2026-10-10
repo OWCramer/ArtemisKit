@@ -292,6 +292,7 @@ case "snapshot":
                 print(String(repeating: "  ", count: depth) + "\(layer.id) \(layer.file ?? (layer.color.map { String($0, radix: 16) } ?? "-")) \(Int(layer.width))x\(Int(layer.height)) @\(Int(layer.left)),\(Int(layer.top)) a=\(Int(layer.alpha)) s=\(Int(layer.xscale)) v=\(layer.visible) img=\(layer.image != nil)")
                 layer.children.forEach { dump($0, depth + 1) }
             }
+            player.saveGlobals()  // As the app does when it leaves the game.
             if ProcessInfo.processInfo.environment["ARTEMIS_TREE"] != nil { player.stage.root.children.forEach { dump($0, 0) } }
             // ARTEMIS_HIT=x,y: which layers take a click / rollover there at the end.
             if let hit = ProcessInfo.processInfo.environment["ARTEMIS_HIT"]?.split(separator: ",").compactMap({ Double($0) }), hit.count == 2 {

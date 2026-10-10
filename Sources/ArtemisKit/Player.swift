@@ -1108,7 +1108,7 @@ public final class ArtemisPlayer: ArtemisHost {
             } else if interpreter.defersLuaCalls {
                 // No file: the system data only (the newer generation's syssave, after its
                 // Lua has put sys/gscr/conf into g. variables).
-                saveGlobals()
+                writeGlobals()
             } else {
                 save(to: "save.dat")
             }
@@ -1538,7 +1538,7 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// `[reset]`: the engine restarts from the boot script, keeping only `g.` variables.
     private func resetEngine() {
-        saveGlobals()
+        writeGlobals()
         let globals = interpreter.variables.filter { Self.isPersistent($0.key) }
         stage.deleteLayer("")
         stage.present(transition: nil)
@@ -1601,7 +1601,7 @@ public final class ArtemisPlayer: ArtemisHost {
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONEncoder().encode(state).write(to: url, options: .atomic)
-            saveGlobals()
+            writeGlobals()
             record("saved \(url.lastPathComponent)")
         } catch {
             record("save failed: \(error)")
@@ -1680,7 +1680,16 @@ public final class ArtemisPlayer: ArtemisHost {
             || name.hasPrefix("s.segain.")
     }
 
+    /// Writes the `g.` variables (and read lines) out, as when the app leaves the game. The
+    /// newer generation keeps its system, global and config data in Lua tables that reach the
+    /// `g.` variables only when it saves (its onSave handler), so that runs first: a language
+    /// picked at first launch would otherwise be asked again.
     public func saveGlobals() {
+        if interpreter.defersLuaCalls { interpreter.callLuaEvent("onSave") }
+        writeGlobals()
+    }
+
+    private func writeGlobals() {
         try? JSONEncoder().encode(Array(readPositions).sorted()).write(to: resolveSavePath("read.json"), options: .atomic)
         let globals = interpreter.variables.filter { Self.isPersistent($0.key) }
         try? FileManager.default.createDirectory(at: globalsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
