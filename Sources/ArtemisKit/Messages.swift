@@ -644,7 +644,13 @@ public final class ArtemisTextRenderer {
             guard start < end else { continue }
             let x0 = start == line.range.location ? 0 : CTLineGetOffsetForStringIndex(line.line, start, nil)
             let x1 = end >= lineEnd ? line.width : CTLineGetOffsetForStringIndex(line.line, end, nil)
-            rects.append(CGRect(x: line.x + x0, y: line.top, width: x1 - x0, height: line.pitch))
+            // Down to the glyphs' real bottom: a negative spacebottom (NUKITASHI) makes the pitch
+            // shorter than the descenders, which would stay hidden until the line completed.
+            var descent: CGFloat = 0
+            _ = CTLineGetTypographicBounds(line.line, nil, &descent, nil)
+            let outline = layer.layoutFont.outline ? layer.layoutFont.outlineWidth : 0
+            let bottom = max(line.top + line.pitch, line.baseline + descent + outline)
+            rects.append(CGRect(x: line.x + x0, y: line.top, width: x1 - x0, height: bottom - line.top))
         }
         return rects
     }
