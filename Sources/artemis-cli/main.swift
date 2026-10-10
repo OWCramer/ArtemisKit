@@ -18,6 +18,8 @@ let game = URL(fileURLWithPath: arguments[1])
 // A Shiori game folder's `base/` has its `patch/` beside it.
 let patch: URL? = {
     let sibling = game.deletingLastPathComponent().appendingPathComponent("patch", isDirectory: true)
+    // ARTEMIS_NO_PATCH=1: the game as Steam delivered it.
+    guard ProcessInfo.processInfo.environment["ARTEMIS_NO_PATCH"] == nil else { return nil }
     return game.lastPathComponent == "base" && FileManager.default.fileExists(atPath: sibling.path) ? sibling : nil
 }()
 let fs = try ArtemisFileSystem(gameRoot: game, patchRoot: patch)
