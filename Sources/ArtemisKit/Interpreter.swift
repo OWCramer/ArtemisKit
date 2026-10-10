@@ -297,6 +297,11 @@ public final class ArtemisInterpreter {
     /// Runs one evaluated tag: control flow and variables here, macros as calls, the rest
     /// through the host.
     public func perform(_ tag: ArtemisTag) throws {
+        try perform(tag, filterUnhandled: false)
+    }
+
+    /// `filterUnhandled`: a tag the engine doesn't handle goes to the game's tag filter.
+    private func perform(_ tag: ArtemisTag, filterUnhandled: Bool) throws {
         switch tag.name {
         case "call":
             try call(file: tag["file"], label: tag["label"], locals: [:], isMacro: false)
@@ -338,6 +343,7 @@ public final class ArtemisInterpreter {
             case let .wait(reason):
                 state = .waiting(reason)
             case .unhandled:
+                if filterUnhandled, try filterTag(tag) { return }
                 if reportedUnhandled.insert(tag.name).inserted {
                     host.log("unhandled tag \(tag) at \(location)")
                 }
@@ -1136,15 +1142,17 @@ public final class ArtemisInterpreter {
         }
         if Self.traceLua { host?.log("trace: \(String(repeating: "  ", count: luaDepth))e:tag \(tag.name) \(order.map { "\($0)=\(attributes[$0] ?? "")" }.joined(separator: " "))") }
         do {
-            // The newer generation's e:tag goes through its tag filter too.
-            if defersLuaCalls, try filterTag(tag) { return }
+            // The newer generation's e:tag runs the engine's own tags as they are (its
+            // `tags.anime` handles the scenario's [anime] and issues the engine's `anime`
+            // itself), and goes through the game's tag filter for names the engine doesn't
+            // know (`autoplay`).
             if tag.name == "call", defersLuaCalls, luaDepth > 0 {
                 deferredLuaCalls.append((tag["file"], tag["label"]))
             } else if tag.name == "call" {
                 try runNested(file: tag["file"], label: tag["label"])
             } else {
                 let previous = state
-                try perform(tag)
+                try perform(tag, filterUnhandled: defersLuaCalls)
                 // A wait requested from inside Lua can't suspend Lua; carry on. The newer
                 // generation's framework relies on it taking effect once Lua returns.
                 if case .waiting = state, case .running = previous {

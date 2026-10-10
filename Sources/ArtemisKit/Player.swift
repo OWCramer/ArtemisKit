@@ -1340,7 +1340,7 @@ public final class ArtemisPlayer: ArtemisHost {
     /// indentmodify), and the window caption; plus common game macros' names.
     static let acceptedSilently: Set<String> = [
         "caption", "autosave", "keyconfig", "mouse", "prohibit", "wordparts", "indentmodify", "ime", "slider",
-        "uidel", "avoid", "statusbar",
+        "uidel", "avoid", "statusbar", "setonwindowbutton", "delonwindowbutton",
         "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
     ]

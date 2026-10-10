@@ -272,9 +272,9 @@ case "snapshot":
                 switch player.wait {
                 case let .time(end, _):
                     time = min(max(time + 16, end), until)
-                    player.update(time: time)
+                    autoreleasepool { player.update(time: time) }
                 case .stop, .click:
-                    player.update(time: time + 5000)
+                    autoreleasepool { player.update(time: time + 5000) }
                     time += 5000
                     // The update may have moved on by itself (skip, auto, timers).
                     if player.wait != .stop, player.wait != .click { continue }
@@ -288,7 +288,7 @@ case "snapshot":
                     let tap = taps.removeFirst()
                     print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
                     let tappedText = player.wait == .click
-                    if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
+                    autoreleasepool { if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) } }
                     // ARTEMIS_SKIP=1: skip mode after each tap on text (it stops at choices; a
                     // tap at a [stop] is a choice or a button, which skip would ignore).
                     if ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil, tappedText { player.setSkipMode(true, force: true) }
@@ -297,7 +297,7 @@ case "snapshot":
                 case .videoLayer:
                     // Video layers play out on the clock.
                     time += 16
-                    player.update(time: time)
+                    autoreleasepool { player.update(time: time) }
                 case .dialog, .sound:
                     break loop
                 case .none:

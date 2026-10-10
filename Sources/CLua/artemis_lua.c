@@ -328,6 +328,14 @@ static const char *LUA_PRELUDE =
     "function e:setUseGlobalCapture(b) end\n"
     "function e:writeClipboard(s) q('clipboard', s) end\n"
     "function e:callShellExecute(t) if t and t.file then q('openURL', t.file) end return 0 end\n"
+    // Console capture rules, the debugger's skip, a Windows font cache and E-mote (none of
+    // which exist here): harmless answers, so code that reaches them carries on.
+    "function e:callOeAPI(t) return 0 end\n"
+    "function e:debugSkip(t) end\n"
+    "function e:restoreFontCache(p) end\n"
+    "function e:getEmoteVersion() return 0 end\n"
+    "function e:getEmoteLayer(t) return nil end\n"
+    "function e:createEmoteLayer(t) return nil end\n"
     "function e:initNis(n) return true end\n"
     ;
 
