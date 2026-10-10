@@ -282,6 +282,11 @@ public final class ArtemisPlayer: ArtemisHost {
             waitStarted = time
         }
         interpreter.callLuaEvent("onEnterFrame")
+        if clickKeyPressed {
+            clickKeyPressed = false
+            if ArtemisInterpreter.traceLua, wait == .click { record("trace: click key advances") }
+            if wait == .click { advance() }
+        }
         messages.advanceReveal(by: max(0, time - lastUpdate), instant: skipMode)
         lastUpdate = time
         switch wait {
@@ -297,6 +302,7 @@ public final class ArtemisPlayer: ArtemisHost {
             let autoDelay = Double(interpreter.value(of: "s.automodewait") ?? "") ?? 2000
             if messages.isRevealing || (autoMode && voicePlaying) { waitStarted = time }
             if skipMode || (autoMode && !messages.isRevealing && time - waitStarted >= max(300, autoDelay)) {
+                if ArtemisInterpreter.traceLua { record("trace: \(skipMode ? "skip" : "auto") advances") }
                 advance()
             }
         case let .sound(id, _):
@@ -395,29 +401,22 @@ public final class ArtemisPlayer: ArtemisHost {
             fire(link, interrupt: false)
             return
         }
+        // The newer generation's buttons, at a [stop] or beside text. When its Lua decides
+        // what a click does (it set the click-wait keys), text only moves on when the key
+        // handler presses one of them.
+        if interpreter.defersLuaCalls, wait == .stop || wait == .click {
+            let point = touchPoint(near: point)
+            if wait == .stop || stage.clickTarget(at: point) != nil || clickKeys != nil {
+                pressButton(at: point)
+                return
+            }
+        }
         switch wait {
         case .stop:
-            // A fingertip is less exact than a mouse: buttons that only take their opaque
-            // pixels (NUKITASHI's title words) are found a little way off too.
             let point = touchPoint(near: point)
-            // A finger has no hover: in the newer generation the button under it is rolled
-            // over first, as the mouse would have (NUKITASHI's buttons act on the one the
-            // cursor is on).
-            if interpreter.defersLuaCalls, let id = stage.eventTarget(at: point, type: "rollover"), id != hoveredLayer,
-               let event = stage.events[id]?["rollover"], event.attributes["file"] == nil, event.attributes["label"] == nil {
-                hoveredLayer = id
-                wait = .none
-                fire(event.attributes, interrupt: false)
-            }
-            if wait == .stop, let (_, event) = stage.clickTarget(at: point) {
-                wait = .none
-                fire(event.attributes, interrupt: false)
-            }
-            // The left button's own handler (key 1) runs after the layer's: NUKITASHI's
-            // buttons only note the click, and the key handler acts on it.
-            if interpreter.defersLuaCalls, wait == .stop, let handler = keyHandlers["1"], handler["file"] == nil, handler["label"] == nil {
-                fireHandler(handler, tagName: "setonpush")
-            }
+            guard let (_, event) = stage.clickTarget(at: point) else { return }
+            wait = .none
+            fire(event.attributes, interrupt: false)
         case .click, .time, .sound, .videoLayer:
             // On-screen buttons (MENU, quick save, ...) stay live while text waits; they
             // interrupt the wait and hand it back when they return.
@@ -430,6 +429,30 @@ public final class ArtemisPlayer: ArtemisHost {
             advance()
         case .video, .none, .dialog:
             break
+        }
+    }
+
+    /// A newer-generation button press. A finger has no hover, so the button under it is
+    /// rolled over first, as the mouse would have; then its click; then the left button's own
+    /// handler (key 1), which acts on the click the button noted: NUKITASHI's framework
+    /// dispatches every button that way. Handlers that go nowhere leave the wait as it was
+    /// ([stop], or the [@] beside text), as the engine runs events beside the script.
+    private func pressButton(at point: CGPoint) {
+        let waiting = wait
+        func run(_ attributes: [String: String]) {
+            guard wait == waiting else { return }
+            wait = .none
+            fire(attributes, interrupt: false)
+        }
+        if let id = stage.eventTarget(at: point, type: "rollover"), id != hoveredLayer,
+           let event = stage.events[id]?["rollover"], event.attributes["file"] == nil, event.attributes["label"] == nil {
+            hoveredLayer = id
+            run(event.attributes)
+        }
+        if let (_, event) = stage.clickTarget(at: point) { run(event.attributes) }
+        if let handler = keyHandlers["1"], handler["file"] == nil, handler["label"] == nil,
+           interpreter.filterEvent(tagName: "setonpush", attributes: handler) {
+            run(handler)
         }
     }
 
@@ -714,6 +737,7 @@ public final class ArtemisPlayer: ArtemisHost {
             let key = first.isEmpty ? "*" : first
             if arguments.count > 1, let status = Double(arguments[1]).map({ Int($0) }), status >= 0 {
                 keyOverrides[key] = status
+                if status == 32, clickKeys?.contains(key) == true { clickKeyPressed = true }
             } else {
                 keyOverrides[key] = nil
             }
@@ -758,6 +782,10 @@ public final class ArtemisPlayer: ArtemisHost {
 
     /// e:overrideKey statuses by key id ("*" = every key).
     private var keyOverrides: [String: Int] = [:]
+    /// The newer generation's click-wait keys (`keyconfig role=0`); nil: any tap advances.
+    private var clickKeys: Set<String>?
+    /// One of them was pressed by the game's Lua: the click wait gives way on this frame.
+    private var clickKeyPressed = false
     private var reportedLuaQueries: Set<String> = []
 
     /// tEXt chunks of a PNG (keyword -> text).
@@ -1075,9 +1103,20 @@ public final class ArtemisPlayer: ArtemisHost {
             }
             return .wait("dialog")
         case "save":
-            save(to: tag["file"] ?? "save.dat")
+            if let file = tag["file"] {
+                save(to: file)
+            } else if interpreter.defersLuaCalls {
+                // No file: the system data only (the newer generation's syssave, after its
+                // Lua has put sys/gscr/conf into g. variables).
+                saveGlobals()
+            } else {
+                save(to: "save.dat")
+            }
         case "load":
-            if load(from: tag["file"] ?? "save.dat", transition: tag) { return .wait("loaded") }
+            if load(from: tag["file"] ?? "save.dat", transition: tag) {
+                if wait == .none, interpreter.defersLuaCalls { return .done }
+                return .wait("loaded")
+            }
         case "takess":
             screenshot = renderSnapshot()
         case "savess":
@@ -1114,6 +1153,10 @@ public final class ArtemisPlayer: ArtemisHost {
                 if !skipAllowed { skipMode = false }
             }
             if let unread = tag["unread"] { skipUnread = unread == "1" }
+        case "keyconfig" where interpreter.defersLuaCalls && tag["role"] == "0":
+            // Role 0: the keys that answer a click wait. NUKITASHI sets only its virtual key
+            // 124, which its Lua presses (e:overrideKey) when a click should advance.
+            clickKeys = Set((tag["keys"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
         case "rclick":
             if let allow = tag["allow"] { rightClickAllowed = allow != "0" }
             if let file = tag["file"], !file.isEmpty { rightClickFile = file }
@@ -1303,8 +1346,13 @@ public final class ArtemisPlayer: ArtemisHost {
     private func runEngineEvents() {
         while !pendingEngineEvents.isEmpty {
             let name = pendingEngineEvents.removeFirst()
-            guard let handler = engineHandlers[name] else { continue }
             let tagName = "seton" + (name.split(separator: ":").first.map(String.init) ?? name)
+            guard let handler = engineHandlers[name] else {
+                // The newer generation follows modes through its event filter alone
+                // (NUKITASHI's flg.skip comes from setoncontrolskipin/out).
+                if interpreter.defersLuaCalls { _ = interpreter.filterEvent(tagName: tagName, attributes: [:]) }
+                continue
+            }
             fireHandler(handler, tagName: tagName)
         }
     }
@@ -1575,7 +1623,9 @@ public final class ArtemisPlayer: ArtemisHost {
     /// Puts a saved state back (a save file or e:loadFromMemory).
     private func restore(_ state: ArtemisSaveState, transition: ArtemisTag?) -> Bool {
         do {
-            try interpreter.restore(frames: state.frames)
+            // A save taken mid-script (the newer generation saves from inside save.asb)
+            // carries on from there.
+            try interpreter.restore(frames: state.frames, running: state.wait == "none" && interpreter.defersLuaCalls)
         } catch {
             record("load failed: \(error)")
             return false

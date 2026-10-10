@@ -74,6 +74,9 @@ public final class ArtemisInterpreter {
         var interrupt = false
         /// The right-click script's frame (a second right-click unwinds to its *leave).
         var rightClick = false
+        /// A newer-generation event handler's own frame (its serial): a jump in the handler
+        /// lands here, and its `return` comes back to the wait below.
+        var event = 0
     }
 
     /// Reported as the waiting reason when an interrupt returns.
@@ -297,7 +300,13 @@ public final class ArtemisInterpreter {
         case "var":
             try setVariable(tag)
         case "calllua":
-            do { try callLua(tag) } catch { host?.log("lua error (continuing) at \(location): \(error)") }
+            do { try callLua(tag) } catch {
+                host?.log("lua error (continuing) at \(location): \(error)")
+                // ARTEMIS_LUA_ON_ERROR=<lua> (debugging): runs after each Lua error.
+                if let code = ProcessInfo.processInfo.environment["ARTEMIS_LUA_ON_ERROR"] {
+                    do { try runLua(Data(code.utf8), chunk: "on-error") } catch { host?.log("on-error: \(error)") }
+                }
+            }
         case "macroadd":
             try addMacros(file: tag["file"] ?? "")
         case "macrodel":
@@ -496,12 +505,12 @@ public final class ArtemisInterpreter {
     /// Index of the first interrupt frame (a button or the right-click menu), if any.
     var firstInterruptIndex: Int? { frames.firstIndex { $0.interrupt } }
 
-    func restore(frames saved: [ArtemisSaveState.Frame]) throws {
+    func restore(frames saved: [ArtemisSaveState.Frame], running: Bool = false) throws {
         frames = try saved.map {
             Frame(script: try script($0.file), pc: $0.pc, locals: $0.locals, isMacro: $0.isMacro,
                   interrupt: $0.interrupt, rightClick: $0.rightClick)
         }
-        state = .waiting("loaded")
+        state = running ? .running : .waiting("loaded")
     }
 
     /// Right-click (`[rclick]`): runs the right-click script as an interrupt; inside it, a
@@ -543,17 +552,42 @@ public final class ArtemisInterpreter {
                 try jump(file: file, label: label)
             }
         }
-        else if !interrupt, defersLuaCalls, !frames.isEmpty {
-            // A handler with nowhere to go (NUKITASHI's buttons: `calllua btn_clickex`, which
-            // only notes the click for the per-frame loop) leaves the [stop] waiting.
+        // The newer generation runs a handler with nowhere to go as a call that comes back to
+        // the wait ([stop], or [@] beside text): NUKITASHI's buttons either only note the click
+        // (`calllua btn_clickex`) or jump to a `popfuncNN` label that ends in `return`.
+        var eventSerial = 0
+        if file == nil, label == nil, !interrupt, defersLuaCalls, !frames.isEmpty {
             frames[frames.count - 1].pc = max(0, frames[frames.count - 1].pc - 1)
+            eventSerials += 1
+            eventSerial = eventSerials
+            var frame = frames[frames.count - 1]
+            frame.event = eventSerial
+            frame.barrier = false
+            frame.interrupt = false
+            frame.rightClick = false
+            frames.append(frame)
         }
         if let handler = attributes["handler"], !handler.isEmpty {
             // The handler tag sees every parameter of the event (lyevent.txt), file and
             // label included: handler="jump" jumps to the event's own target.
             var handlerAttributes = attributes
             handlerAttributes["handler"] = nil
+            if eventSerial != 0 { holdingDeferredLua = true }
+            defer { holdingDeferredLua = false }
             try perform(ArtemisTag(name: handler, attributes: handlerAttributes, order: handlerAttributes.keys.sorted()))
+        }
+        if eventSerial != 0 {
+            // A handler that didn't jump leaves its frame as it was: drop it, so what it
+            // queued runs in the script's own place (a choice's `e:enqueueTag jump`) and what
+            // it called returns straight to the wait. A handler that jumped (a button's
+            // `popfuncNN`) keeps its frame, and its `return` comes back to the wait.
+            if let index = frames.lastIndex(where: { $0.event == eventSerial }), index > 0,
+               frames[index].pc == frames[index - 1].pc, frames[index].script.path == frames[index - 1].script.path {
+                frames.remove(at: index)
+            }
+            state = .running
+            if luaDepth == 0 { flushDeferredLua() }
+            return
         }
         state = .running
     }
@@ -841,6 +875,7 @@ public final class ArtemisInterpreter {
     private func runQueuedTags() {
         while !queuedTags.isEmpty, case .running = state {
             let tag = queuedTags.removeFirst()
+            if Self.traceLua { host?.log("trace: queued \(tag.name) at \(location)") }
             do { try perform(tag) } catch { host?.log("queued tag \(tag.name): \(error)") }
         }
     }
@@ -903,9 +938,14 @@ public final class ArtemisInterpreter {
                 i += 2
             }
             queuedTags.append(ArtemisTag(name: tagName, attributes: attributes, order: order))
+            if Self.traceLua { host?.log("trace: \(String(repeating: "  ", count: luaDepth))e:enqueueTag \(tagName) \(order.map { "\($0)=\(attributes[$0] ?? "")" }.joined(separator: " "))") }
             return nil
         case "exists":
-            return fileSystem.file(arguments.first ?? "") != nil ? "1" : "0"
+            // Absolute paths are files on disk: the save folder (`s.savepath`), whose saves
+            // the newer generation checks before listing a slot.
+            let path = arguments.first ?? ""
+            if path.hasPrefix("/") { return FileManager.default.fileExists(atPath: path) ? "1" : "0" }
+            return fileSystem.file(path) != nil ? "1" : "0"
         case "magicPath":
             fileSystem.setMagicPath(arguments.first ?? "", to: arguments.count > 1 ? arguments[1] : "")
             return nil
@@ -1053,7 +1093,13 @@ public final class ArtemisInterpreter {
             attributes[key] = luaString(values[i]!, fileSystem.encoding)
             order.append(key)
         }
-        let tag = ArtemisTag(name: luaString(name, fileSystem.encoding), attributes: attributes, order: order)
+        var tag = ArtemisTag(name: luaString(name, fileSystem.encoding), attributes: attributes, order: order)
+        // The newer generation hands expressions to the engine this way (`cond`:
+        // e:tag{"var", name="t.cond", data="$0!=1"}), so `$` values are evaluated as in scripts.
+        if defersLuaCalls, attributes.values.contains(where: { $0.hasPrefix("$") }),
+           let evaluated = try? evaluate(name: tag.name, order.map { ($0, attributes[$0] ?? "") }) {
+            tag = evaluated
+        }
         if Self.traceLua { host?.log("trace: \(String(repeating: "  ", count: luaDepth))e:tag \(tag.name) \(order.map { "\($0)=\(attributes[$0] ?? "")" }.joined(separator: " "))") }
         do {
             if tag.name == "call", defersLuaCalls, luaDepth > 0 {
@@ -1093,6 +1139,9 @@ public final class ArtemisInterpreter {
     static let traceLua = ProcessInfo.processInfo.environment["ARTEMIS_TRACE_LUA"] != nil
     lazy var defersLuaCalls: Bool = fileSystem.files.keys.contains { $0.lowercased().hasSuffix(".asb") }
     private var luaDepth = 0
+    private var eventSerials = 0
+    /// While an event handler runs: what its Lua queued waits until its frame is settled.
+    private var holdingDeferredLua = false
     private var deferredLuaCalls: [(file: String?, label: String?)] = []
     private var deferredLuaWait: State?
 
@@ -1119,7 +1168,7 @@ public final class ArtemisInterpreter {
         luaDepth += 1
         defer {
             luaDepth -= 1
-            if luaDepth == 0, defersLuaCalls { flushDeferredLua() }
+            if luaDepth == 0, defersLuaCalls, !holdingDeferredLua { flushDeferredLua() }
         }
         var keys: [UnsafeMutablePointer<CChar>?] = []
         var values: [UnsafeMutablePointer<CChar>?] = []

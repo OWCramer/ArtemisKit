@@ -7,6 +7,7 @@ import ImageIO
 // artemis-cli list <game folder>                     every visible file, with its source
 // artemis-cli extract <game folder> <out> [prefix...]  writes files (all, or under prefixes)
 // artemis-cli run <game folder> [waits] [steps]      boots the game headless and reports
+setvbuf(stdout, nil, _IOLBF, 0)  // Line by line, so a run cut short still shows where it got to.
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard arguments.count >= 2 else {
     print("usage: artemis-cli list|extract|run <game folder> ...")
@@ -261,9 +262,11 @@ case "snapshot":
                     guard !taps.isEmpty else { break loop }
                     let tap = taps.removeFirst()
                     print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
+                    let tappedText = player.wait == .click
                     if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) }
-                    // ARTEMIS_SKIP=1: skip mode after each tap (it stops at choices).
-                    if ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil { player.setSkipMode(true, force: true) }
+                    // ARTEMIS_SKIP=1: skip mode after each tap on text (it stops at choices; a
+                    // tap at a [stop] is a choice or a button, which skip would ignore).
+                    if ProcessInfo.processInfo.environment["ARTEMIS_SKIP"] != nil, tappedText { player.setSkipMode(true, force: true) }
                 case .video:
                     player.videoFinished()
                 case .videoLayer:
@@ -277,7 +280,7 @@ case "snapshot":
                 }
                 if player.failure != nil { break loop }
             }
-            print("stopped: \(player.wait) at \(player.interpreter.location), t=\(Int(time)) ms")
+            print("stopped: \(player.wait) at \(player.interpreter.location), t=\(Int(time)) ms, script \(player.interpreter.state)")
             if let failure = player.failure { print("FAILED: \(failure)") }
             print("message layer: \(player.messages.current)")
             for layer in player.messages.layers.values where !layer.text.isEmpty {
@@ -288,6 +291,12 @@ case "snapshot":
                 layer.children.forEach { dump($0, depth + 1) }
             }
             if ProcessInfo.processInfo.environment["ARTEMIS_TREE"] != nil { player.stage.root.children.forEach { dump($0, 0) } }
+            // ARTEMIS_HIT=x,y: which layers take a click / rollover there at the end.
+            if let hit = ProcessInfo.processInfo.environment["ARTEMIS_HIT"]?.split(separator: ",").compactMap({ Double($0) }), hit.count == 2 {
+                let point = CGPoint(x: hit[0], y: hit[1])
+                print("hit \(point): click \(player.stage.clickTarget(at: point)?.layer ?? "none"), rollover \(player.stage.eventTarget(at: point, type: "rollover") ?? "none")")
+                for (id, events) in player.stage.events where id.hasPrefix("1.80.120") { print("  events \(id): \(events.keys.sorted()) enabled \(events.values.map(\.enabled))") }
+            }
             guard let image = player.renderSnapshot() else { print("render failed"); return }
             let destination = CGImageDestinationCreateWithURL(output as CFURL, "public.png" as CFString, 1, nil)!
             CGImageDestinationAddImage(destination, image, nil)
