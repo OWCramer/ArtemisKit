@@ -81,6 +81,17 @@ public final class ArtemisInterpreter {
 
     public let fileSystem: ArtemisFileSystem
     public weak var host: ArtemisHost?
+
+    /// What `[var system="os"]` answers: "iphone", unless the game is a PC build of the Lua ADV
+    /// framework with tables for Windows and none for iOS (NUKITASHI's `system/table/list_*.tbl`;
+    /// its Android table is a stub): then "windows", whose tables are complete. The framework
+    /// still turns touch on for Windows.
+    lazy var reportedOS: String = {
+        let tables = fileSystem.files.keys.map { $0.lowercased() }.filter { $0.hasPrefix("system/table/list_") }
+        let hasIOS = tables.contains { $0.hasPrefix("system/table/list_ios") }
+        let hasWindows = tables.contains { $0.hasPrefix("system/table/list_windows") }
+        return !hasIOS && hasWindows ? "windows" : "iphone"
+    }()
     public private(set) var state: State = .running
     public var variables: [String: String] = [:]
     /// Tag name -> (file, label) for tags defined by `macroadd`.
@@ -532,6 +543,11 @@ public final class ArtemisInterpreter {
                 try jump(file: file, label: label)
             }
         }
+        else if !interrupt, defersLuaCalls, !frames.isEmpty {
+            // A handler with nowhere to go (NUKITASHI's buttons: `calllua btn_clickex`, which
+            // only notes the click for the per-frame loop) leaves the [stop] waiting.
+            frames[frames.count - 1].pc = max(0, frames[frames.count - 1].pc - 1)
+        }
         if let handler = attributes["handler"], !handler.isEmpty {
             // The handler tag sees every parameter of the event (lyevent.txt), file and
             // label included: handler="jump" jumps to the event's own target.
@@ -634,7 +650,7 @@ public final class ArtemisInterpreter {
             let exists = fileSystem.file(file) != nil || (file.hasPrefix("/") && FileManager.default.fileExists(atPath: file))
             return exists ? "1" : "0"
         case "os":
-            return "iphone"
+            return reportedOS
         case "length":
             // Bytes in the game's encoding; mode=1 counts characters.
             return String(tag["mode"] == "1" ? source.count : byteCount(source))
@@ -1038,14 +1054,21 @@ public final class ArtemisInterpreter {
             order.append(key)
         }
         let tag = ArtemisTag(name: luaString(name, fileSystem.encoding), attributes: attributes, order: order)
+        if Self.traceLua { host?.log("trace: \(String(repeating: "  ", count: luaDepth))e:tag \(tag.name) \(order.map { "\($0)=\(attributes[$0] ?? "")" }.joined(separator: " "))") }
         do {
-            if tag.name == "call" {
+            if tag.name == "call", defersLuaCalls, luaDepth > 0 {
+                deferredLuaCalls.append((tag["file"], tag["label"]))
+            } else if tag.name == "call" {
                 try runNested(file: tag["file"], label: tag["label"])
             } else {
                 let previous = state
                 try perform(tag)
-                // A wait requested from inside Lua can't suspend Lua; carry on.
-                if case .waiting = state, case .running = previous { state = .running }
+                // A wait requested from inside Lua can't suspend Lua; carry on. The newer
+                // generation's framework relies on it taking effect once Lua returns.
+                if case .waiting = state, case .running = previous {
+                    if defersLuaCalls, luaDepth > 0 { deferredLuaWait = state }
+                    state = .running
+                }
             }
         } catch {
             host?.log("lua e:tag \(tag): \(error)")
@@ -1063,8 +1086,41 @@ public final class ArtemisInterpreter {
         }
     }
 
+    /// The newer generation (compiled `.asb` scripts, NUKITASHI) runs its whole game in a Lua
+    /// framework that queues tags with `e:tag{"call", label="estagNN"}` and expects them, and
+    /// any wait they start, to take effect after the Lua function returns, as the engine does.
+    /// The older games are written for calls that finish inside Lua, which Shiori keeps.
+    static let traceLua = ProcessInfo.processInfo.environment["ARTEMIS_TRACE_LUA"] != nil
+    lazy var defersLuaCalls: Bool = fileSystem.files.keys.contains { $0.lowercased().hasSuffix(".asb") }
+    private var luaDepth = 0
+    private var deferredLuaCalls: [(file: String?, label: String?)] = []
+    private var deferredLuaWait: State?
+
+    /// After the outermost Lua call: the tags it queued with `e:enqueueTag` (run now, as the
+    /// engine runs them once Lua returns), the calls it made (first one on top), then its wait.
+    private func flushDeferredLua() {
+        runQueuedTags()
+        let calls = deferredLuaCalls
+        deferredLuaCalls = []
+        for pending in calls.reversed() {
+            do { try call(file: pending.file, label: pending.label, locals: [:], isMacro: false) } catch {
+                host?.log("lua e:tag call \(pending.file ?? "") *\(pending.label ?? ""): \(error)")
+            }
+        }
+        if let wait = deferredLuaWait {
+            deferredLuaWait = nil
+            if case .running = state { state = wait }
+        }
+    }
+
     private func callLua(_ tag: ArtemisTag) throws {
         guard let function = tag["function"] else { return }
+        if Self.traceLua { host?.log("trace: \(String(repeating: "  ", count: luaDepth))lua \(function) at \(location)") }
+        luaDepth += 1
+        defer {
+            luaDepth -= 1
+            if luaDepth == 0, defersLuaCalls { flushDeferredLua() }
+        }
         var keys: [UnsafeMutablePointer<CChar>?] = []
         var values: [UnsafeMutablePointer<CChar>?] = []
         for key in tag.order where key != "function" {

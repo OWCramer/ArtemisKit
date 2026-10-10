@@ -378,6 +378,11 @@ public final class ArtemisTextRenderer {
     private let fontData: (String) -> Data?
     /// Indent pairs, from the messages (`[indent]`).
     public var indentPairs: () -> [Character: Character] = { [:] }
+    /// The newer generation (compiled `.asb` scripts, NUKITASHI) tightens only full-width
+    /// characters with `kerning`, and its lines are the font's win (not typographic) height:
+    /// NUKITASHI's English, at 30 px with kerning -4, sets Latin at its natural advance and
+    /// 39 px lines in the official Steam screenshots.
+    public var newerGeneration = false
 
     public init(fontData: @escaping (String) -> Data?) {
         self.fontData = fontData
@@ -408,12 +413,16 @@ public final class ArtemisTextRenderer {
     /// descender, line gap), as the engine measures lines: Memory's Dogma's choice rows and
     /// Ne no Kami's official screenshots both match these, not the hhea metrics CoreText
     /// reports. Falls back to CoreText's metrics for fonts without an OS/2 table.
-    static func lineMetrics(_ font: CTFont, size: Double) -> (ascent: Double, height: Double) {
+    static func lineMetrics(_ font: CTFont, size: Double, win: Bool = false) -> (ascent: Double, height: Double) {
         if let table = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?, table.count >= 74 {
             func int16(_ offset: Int) -> Double {
                 Double(Int16(bitPattern: UInt16(table[table.startIndex + offset]) << 8 | UInt16(table[table.startIndex + offset + 1])))
             }
             let unitsPerEm = Double(CTFontGetUnitsPerEm(font))
+            if win, table.count >= 78, unitsPerEm > 0 {
+                let ascent = Double(UInt16(bitPattern: Int16(int16(74)))), descent = Double(UInt16(bitPattern: Int16(int16(76))))
+                if ascent > 0 { return (ascent * size / unitsPerEm, (ascent + descent) * size / unitsPerEm) }
+            }
             let ascender = int16(68), descender = int16(70), lineGap = int16(72)
             if unitsPerEm > 0, ascender > 0 {
                 let scale = size / unitsPerEm
@@ -475,9 +484,33 @@ public final class ArtemisTextRenderer {
             case .measure:
                 break
             }
-            result.append(NSAttributedString(string: run.text, attributes: attributes))
+            let piece = NSMutableAttributedString(string: run.text, attributes: attributes)
+            if newerGeneration, spec.kerning != 0 {
+                // Only full-width characters are tightened.
+                var offset = 0
+                for character in run.text {
+                    let length = character.utf16.count
+                    if !Self.isFullWidth(character) {
+                        piece.addAttribute(NSAttributedString.Key(kCTKernAttributeName as String), value: 0, range: NSRange(location: offset, length: length))
+                    }
+                    offset += length
+                }
+            }
+            result.append(piece)
         }
         return result
+    }
+
+    /// East Asian wide and full-width characters (CJK, kana, hangul, full-width forms).
+    static func isFullWidth(_ character: Character) -> Bool {
+        guard let value = character.unicodeScalars.first?.value else { return false }
+        switch value {
+        case 0x1100...0x115F, 0x2E80...0x303E, 0x3041...0x33FF, 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF,
+             0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE30...0xFE4F, 0xFF00...0xFF60, 0xFFE0...0xFFE6, 0x20000...0x3FFFD:
+            return true
+        default:
+            return false
+        }
     }
 
     /// CoreText stroke width (percent of the font size) for an outline `outlineWidth` px wide
@@ -495,7 +528,7 @@ public final class ArtemisTextRenderer {
         let text = string.string as NSString
         let typesetter = CTTypesetterCreateWithAttributedString(string)
         let length = text.length
-        let (ascent, textHeight) = Self.lineMetrics(ctFont, size: spec.size)
+        let (ascent, textHeight) = Self.lineMetrics(ctFont, size: spec.size, win: newerGeneration)
         let pitch = spec.linePitch(textHeight: textHeight)
         let pairs = indentPairs()
         var lines: [Line] = []
@@ -591,7 +624,7 @@ public final class ArtemisTextRenderer {
                 }
                 let rubyLine = CTLineCreateWithAttributedString(NSAttributedString(string: ruby, attributes: attributes))
                 let rubyWidth = CTLineGetTypographicBounds(rubyLine, nil, nil, nil)
-                let (rubyAscent, _) = Self.lineMetrics(font(spec.rubyFace ?? spec.face, size: rubySize), size: rubySize)
+                let (rubyAscent, _) = Self.lineMetrics(font(spec.rubyFace ?? spec.face, size: rubySize), size: rubySize, win: newerGeneration)
                 context.saveGState()
                 context.translateBy(x: line.x + (x0 + x1) / 2 - rubyWidth / 2, y: line.top + spec.spaceTop + rubyAscent)
                 context.scaleBy(x: 1, y: -1)

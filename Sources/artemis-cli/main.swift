@@ -1,5 +1,6 @@
 import ArtemisKit
 import CoreGraphics
+import CoreText
 import Foundation
 import ImageIO
 
@@ -13,7 +14,12 @@ guard arguments.count >= 2 else {
 }
 let command = arguments[0]
 let game = URL(fileURLWithPath: arguments[1])
-let fs = try ArtemisFileSystem(gameRoot: game)
+// A Shiori game folder's `base/` has its `patch/` beside it.
+let patch: URL? = {
+    let sibling = game.deletingLastPathComponent().appendingPathComponent("patch", isDirectory: true)
+    return game.lastPathComponent == "base" && FileManager.default.fileExists(atPath: sibling.path) ? sibling : nil
+}()
+let fs = try ArtemisFileSystem(gameRoot: game, patchRoot: patch)
 
 /// Presents nothing; logs what it's asked to do and resolves waits immediately.
 @MainActor
@@ -86,6 +92,53 @@ case "list":
         case .patch: source = "patch"
         }
         print("\(file.size)\t\(source)\t\(file.path)")
+    }
+case "cat":
+    // artemis-cli cat <game> <path>: one file's text, printed (read in memory; nothing is written).
+    guard arguments.count >= 3 else { print("cat needs a path"); exit(2) }
+    guard let data = try fs.data(arguments[2]) else { print("no \(arguments[2])"); exit(1) }
+    print(decodeScriptText(data))
+case "hex":
+    // artemis-cli hex <game> <path> [bytes]: the start of one file in hex (in memory only).
+    guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("hex needs a path"); exit(2) }
+    let count = arguments.count > 3 ? Int(arguments[3]) ?? 512 : 512
+    let bytes = [UInt8](data.prefix(count))
+    print("\(data.count) bytes")
+    for row in stride(from: 0, to: bytes.count, by: 16) {
+        let slice = bytes[row..<min(row + 16, bytes.count)]
+        let hex = slice.map { String(format: "%02x", $0) }.joined(separator: " ")
+        let text = String(slice.map { $0 >= 32 && $0 < 127 ? Character(UnicodeScalar($0)) : "." })
+        print(String(format: "%06x  ", row) + hex.padding(toLength: 48, withPad: " ", startingAt: 0) + "  " + text)
+    }
+case "font":
+    // artemis-cli font <game> <path> [text] [size]: whether CoreText can use a font file, and how
+    // wide it sets the text (in memory only).
+    guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("font needs a path"); exit(2) }
+    if let descriptor = CTFontManagerCreateFontDescriptorFromData(data as CFData) {
+        let sample = arguments.count > 3 ? arguments[3] : "Who should"
+        let size = arguments.count > 4 ? Double(arguments[4]) ?? 30 : 30
+        let font = CTFontCreateWithFontDescriptor(descriptor, size, nil)
+        let glyphs = Array(sample.utf16)
+        var ids = [CGGlyph](repeating: 0, count: glyphs.count)
+        CTFontGetGlyphsForCharacters(font, glyphs, &ids, glyphs.count)
+        var advances = [CGSize](repeating: .zero, count: glyphs.count)
+        let width = CTFontGetAdvancesForGlyphs(font, .horizontal, ids, &advances, ids.count)
+        print("\(CTFontCopyPostScriptName(font)) (\(data.count) bytes): \"\(sample)\" (\(glyphs.count) characters) at \(size) px is \(width) px")
+        print("CoreText ascent \(CTFontGetAscent(font)) descent \(CTFontGetDescent(font)) leading \(CTFontGetLeading(font)) unitsPerEm \(CTFontGetUnitsPerEm(font))")
+        if let os2 = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?, os2.count >= 78 {
+            func int16(_ offset: Int) -> Int { Int(Int16(bitPattern: UInt16(os2[os2.startIndex + offset]) << 8 | UInt16(os2[os2.startIndex + offset + 1]))) }
+            print("fsSelection \(String(int16(62), radix: 2)) OS/2 typo ascender \(int16(68)) descender \(int16(70)) lineGap \(int16(72)), win ascent \(UInt16(bitPattern: Int16(int16(74)))) descent \(UInt16(bitPattern: Int16(int16(76))))")
+        }
+    } else {
+        print("CoreText can't read \(arguments[2]) (\(data.count) bytes)")
+    }
+case "commands":
+    // artemis-cli commands <game> <script> [count]: a script as parsed (.iet, .txt or .asb).
+    guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("commands needs a script"); exit(2) }
+    let script = ArtemisScript(path: arguments[2], data: data, encoding: fs.encoding)
+    print("\(script.commands.count) commands, \(script.labels.count) labels")
+    for command in script.commands.prefix(arguments.count > 3 ? Int(arguments[3]) ?? 40 : 40) {
+        print(command.line, command.kind)
     }
 case "extract":
     guard arguments.count >= 3 else { print("extract needs an output folder"); exit(2) }
@@ -177,10 +230,10 @@ case "snapshot":
     }
     MainActor.assumeIsolated {
         do {
-            let player = try ArtemisPlayer(gameRoot: game)
+            let player = try ArtemisPlayer(gameRoot: game, patchRoot: patch)
             if let saves = ProcessInfo.processInfo.environment["ARTEMIS_SAVES"] { player.savePath = URL(fileURLWithPath: saves) }
             player.onLog = { message in
-                if !message.hasPrefix("debug:") && !message.hasPrefix("lua:") { print("· \(message)") }
+                if ProcessInfo.processInfo.environment["ARTEMIS_LUALOG"] != nil || (!message.hasPrefix("debug:") && !message.hasPrefix("lua:")) { print("· \(message)") }
             }
             try player.start()
             var time = 0.0

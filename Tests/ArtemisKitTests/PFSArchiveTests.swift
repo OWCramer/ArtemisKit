@@ -118,4 +118,21 @@ private func temporaryFolder() throws -> URL {
         #expect(try fs.data("system.ini") == Data("loose".utf8))
         #expect(fs.file("missing.txt") == nil)
     }
+
+    @Test func patchArchivesJoinTheGameSet() throws {
+        let game = try temporaryFolder()
+        let patch = try temporaryFolder()
+        try Data().write(to: game.appendingPathComponent("Game.exe"))
+        try makeArchive([("tag.ini", Data("base".utf8)), ("a.txt", Data("A".utf8))]).write(to: game.appendingPathComponent("Game.pfs"))
+        try makeArchive([("tag.ini", Data("update".utf8))]).write(to: game.appendingPathComponent("Game.pfs.000"))
+        // An R18 patch: higher-numbered archives with the same name, dropped in the patch folder.
+        try makeArchive([("tag.ini", Data("patch".utf8)), ("b.txt", Data("B".utf8))]).write(to: patch.appendingPathComponent("game.pfs.010"))
+        let fs = try ArtemisFileSystem(gameRoot: game, patchRoot: patch)
+        #expect(fs.archives.map(\.url.lastPathComponent) == ["Game.pfs", "Game.pfs.000", "game.pfs.010"])
+        #expect(try fs.data("tag.ini") == Data("patch".utf8))
+        #expect(try fs.data("a.txt") == Data("A".utf8))
+        #expect(try fs.data("b.txt") == Data("B".utf8))
+        // The archive itself isn't a loose patch file.
+        #expect(fs.file("game.pfs.010") == nil)
+    }
 }

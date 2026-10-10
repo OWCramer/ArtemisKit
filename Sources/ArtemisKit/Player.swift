@@ -85,6 +85,7 @@ public final class ArtemisPlayer: ArtemisHost {
     public private(set) lazy var textRenderer: ArtemisTextRenderer = {
         let renderer = ArtemisTextRenderer { [fileSystem] path in try? fileSystem.data(path) }
         renderer.indentPairs = { [weak self] in self?.messages.indentPairs ?? [:] }
+        renderer.newerGeneration = interpreter.defersLuaCalls
         return renderer
     }()
     /// Text of the current message layer (for logs).
@@ -133,6 +134,8 @@ public final class ArtemisPlayer: ArtemisHost {
     public private(set) var rightClickAllowed = true
     /// `[setonpush key=...]` handlers by key id (2 = right button, 27 = Esc, ...).
     private var keyHandlers: [String: [String: String]] = [:]
+    /// The layer a tap last rolled over.
+    private var hoveredLayer: String?
     private var rightClickFile = "rclick.iet"
     public private(set) var failure: String?
 
@@ -183,6 +186,8 @@ public final class ArtemisPlayer: ArtemisHost {
     private func systemVariable(_ name: String) -> String? {
         switch name {
         case "s.current_message_layer": return messages.current
+        // Asked by PC builds Shiori presents as Windows (see ArtemisInterpreter.reportedOS).
+        case "s.windowsversion": return "10.0"
         case "s.status.automode": return autoMode ? "1" : "0"
         case "s.status.commandskip": return skipMode && !forceSkip ? "1" : "0"
         case "s.status.controlskip": return skipMode && forceSkip ? "1" : "0"
@@ -392,9 +397,27 @@ public final class ArtemisPlayer: ArtemisHost {
         }
         switch wait {
         case .stop:
-            guard let (_, event) = stage.clickTarget(at: point) else { return }
-            wait = .none
-            fire(event.attributes, interrupt: false)
+            // A fingertip is less exact than a mouse: buttons that only take their opaque
+            // pixels (NUKITASHI's title words) are found a little way off too.
+            let point = touchPoint(near: point)
+            // A finger has no hover: in the newer generation the button under it is rolled
+            // over first, as the mouse would have (NUKITASHI's buttons act on the one the
+            // cursor is on).
+            if interpreter.defersLuaCalls, let id = stage.eventTarget(at: point, type: "rollover"), id != hoveredLayer,
+               let event = stage.events[id]?["rollover"], event.attributes["file"] == nil, event.attributes["label"] == nil {
+                hoveredLayer = id
+                wait = .none
+                fire(event.attributes, interrupt: false)
+            }
+            if wait == .stop, let (_, event) = stage.clickTarget(at: point) {
+                wait = .none
+                fire(event.attributes, interrupt: false)
+            }
+            // The left button's own handler (key 1) runs after the layer's: NUKITASHI's
+            // buttons only note the click, and the key handler acts on it.
+            if interpreter.defersLuaCalls, wait == .stop, let handler = keyHandlers["1"], handler["file"] == nil, handler["label"] == nil {
+                fireHandler(handler, tagName: "setonpush")
+            }
         case .click, .time, .sound, .videoLayer:
             // On-screen buttons (MENU, quick save, ...) stay live while text waits; they
             // interrupt the wait and hand it back when they return.
@@ -408,6 +431,23 @@ public final class ArtemisPlayer: ArtemisHost {
         case .video, .none, .dialog:
             break
         }
+    }
+
+    /// The point itself if a button takes it, else the nearest point within 16 stage pixels
+    /// that one does (rings of 8 directions), else the point.
+    private func touchPoint(near point: CGPoint) -> CGPoint {
+        if stage.clickTarget(at: point) != nil { return point }
+        for radius in stride(from: 4.0, through: 16, by: 4) {
+            for step in 0 ..< 8 {
+                let angle = Double(step) * .pi / 4
+                let candidate = CGPoint(x: point.x + radius * cos(angle), y: point.y + radius * sin(angle))
+                if stage.clickTarget(at: candidate) != nil {
+                    interpreter.pointer = candidate
+                    return candidate
+                }
+            }
+        }
+        return point
     }
 
     public enum DragPhase { case began, moved, ended }
@@ -597,10 +637,13 @@ public final class ArtemisPlayer: ArtemisHost {
             // A button or the right-click menu returned: back to the wait it interrupted.
             wait = savedWaits.popLast() ?? .none
             if wait == .none { runInterpreter() }
-        case .waiting:
-            break
+        case let .waiting(reason):
+            if traceWaits { record("trace: wait \(reason) at \(interpreter.location)") }
         }
     }
+
+    /// Logs every wait the script stops at (debug).
+    public var traceWaits = false
 
     private func record(_ message: String) {
         log.append(message)
@@ -695,6 +738,9 @@ public final class ArtemisPlayer: ArtemisHost {
             return data.map { Self.pngComments($0).flatMap { [$0.key, $0.value] }.joined(separator: us) }
         case "bindSurface":
             _ = stage.image(first)
+            return nil
+        case "unbindSurface":
+            // The stage's image cache keeps what it decoded; nothing to release here.
             return nil
         case "touchHold":
             return nil
@@ -997,8 +1043,14 @@ public final class ArtemisPlayer: ArtemisHost {
         case "setonpush":
             guard let key = tag["key"] else { break }
             var attributes = tag.attributes
-            attributes["key"] = nil
-            if attributes["file"] == nil, attributes["label"] == nil { keyHandlers[key] = nil } else { keyHandlers[key] = attributes }
+            if attributes["handler"] == nil { attributes["key"] = nil }  // A handler is told its key.
+            // In the newer generation a handler alone (`handler=calllua`, NUKITASHI's key
+            // dispatch) counts too.
+            if attributes["file"] == nil, attributes["label"] == nil, attributes["handler"] == nil || !interpreter.defersLuaCalls {
+                keyHandlers[key] = nil
+            } else {
+                keyHandlers[key] = attributes
+            }
         case "delonpush":
             if let key = tag["key"] { keyHandlers[key] = nil }
         case "dialog":
@@ -1009,6 +1061,7 @@ public final class ArtemisPlayer: ArtemisHost {
                 return .done
             }
             wait = .dialog
+            if traceWaits { record("trace: dialog \(tag["title"] ?? "") — \(tag["message"] ?? "")") }
             media.presentDialog(title: tag["title"] ?? "", message: tag["message"] ?? tag["messagae"] ?? "",
                                 cancellable: varname != nil, textField: textField != nil) { [weak self] ok, text in
                 guard let self, self.wait == .dialog else { return }
@@ -1067,6 +1120,10 @@ public final class ArtemisPlayer: ArtemisHost {
         case "stop":
             wait = .stop
             return .wait("stop")
+        case "@":
+            // The newer generation's click wait, between clickStart and clickEnd.
+            wait = .click
+            return .wait("click")
         case "rp":
             recordHistory()
             let store = tag["backlog"].map { $0 == "1" } ?? writeBacklog

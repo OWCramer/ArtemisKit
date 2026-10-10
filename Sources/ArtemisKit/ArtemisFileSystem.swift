@@ -38,7 +38,7 @@ public final class ArtemisFileSystem: @unchecked Sendable {
 
     public init(gameRoot: URL, patchRoot: URL? = nil) throws {
         self.gameRoot = gameRoot
-        let sets = try Self.archiveSets(in: gameRoot)
+        let sets = try Self.archiveSets(in: gameRoot, patchRoot: patchRoot)
         var archives: [PFSArchive] = []
         var files: [String: File] = [:]
         // Lowest precedence first; later assignments win.
@@ -56,7 +56,7 @@ public final class ArtemisFileSystem: @unchecked Sendable {
             files[relative.lowercased()] = File(path: relative, size: size, source: .loose(url), entry: nil)
         }
         if let patchRoot {
-            for (relative, url, size) in Self.looseFiles(in: patchRoot, skipping: { _ in false }) {
+            for (relative, url, size) in Self.looseFiles(in: patchRoot, skipping: { $0.contains(".pfs") }) {
                 files[relative.lowercased()] = File(path: relative, size: size, source: .patch(url), entry: nil)
             }
         }
@@ -126,25 +126,32 @@ public final class ArtemisFileSystem: @unchecked Sendable {
         var urls: [URL]
     }
 
-    /// Every `.pfs` set under the game folder, grouped with its numbered patches.
-    static func archiveSets(in gameRoot: URL) throws -> [ArchiveSet] {
-        let rootPath = gameRoot.standardizedFileURL.path
-        guard let enumerator = FileManager.default.enumerator(at: gameRoot, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
+    /// Every `.pfs` set under the game folder, grouped with its numbered patches. Archives in
+    /// the patch folder join the set at the same path (the NUKITASHI R18 patch's
+    /// `NUKITASHI.pfs.010` etc.), and replace a game archive with the same name.
+    static func archiveSets(in gameRoot: URL, patchRoot: URL? = nil) throws -> [ArchiveSet] {
         var groups: [String: [(Int, URL)]] = [:]
         var exeNames: Set<String> = []
-        for case let url as URL in enumerator {
-            let path = url.standardizedFileURL.path
-            guard path.hasPrefix(rootPath + "/") else { continue }
-            let relative = String(path.dropFirst(rootPath.count + 1))
-            let lower = relative.lowercased()
-            if !lower.contains("/"), lower.hasSuffix(".exe") { exeNames.insert(String(lower.dropLast(4))) }
-            guard let range = lower.range(of: ".pfs", options: .backwards) else { continue }
-            let suffix = lower[range.upperBound...]
-            let mount = String(relative[..<relative.index(relative.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.lowerBound))])
-            if suffix.isEmpty {
-                groups[mount, default: []].append((-1, url))
-            } else if suffix.first == ".", let number = Int(suffix.dropFirst()) {
-                groups[mount, default: []].append((number, url))
+        for folder in [gameRoot] + (patchRoot.map { [$0] } ?? []) {
+            let rootPath = folder.standardizedFileURL.path
+            guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey]) else { continue }
+            for case let url as URL in enumerator {
+                let path = url.standardizedFileURL.path
+                guard path.hasPrefix(rootPath + "/") else { continue }
+                let relative = String(path.dropFirst(rootPath.count + 1))
+                let lower = relative.lowercased()
+                if !lower.contains("/"), lower.hasSuffix(".exe") { exeNames.insert(String(lower.dropLast(4))) }
+                guard let range = lower.range(of: ".pfs", options: .backwards) else { continue }
+                let suffix = lower[range.upperBound...]
+                let named = String(relative[..<relative.index(relative.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: range.lowerBound))])
+                // A patch archive's folder matches the game's whatever its case.
+                let mount = groups.keys.first { $0.lowercased() == named.lowercased() } ?? named
+                let number: Int
+                if suffix.isEmpty { number = -1 } else if suffix.first == ".", let n = Int(suffix.dropFirst()) { number = n } else { continue }
+                var group = groups[mount, default: []]
+                group.removeAll { $0.0 == number }
+                group.append((number, url))
+                groups[mount] = group
             }
         }
         // The root archive: the one named after the exe, else root.pfs.

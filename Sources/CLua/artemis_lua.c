@@ -124,13 +124,14 @@ static int e_include(lua_State *L) {
     return 0;
 }
 
-// e:random([n]): 0..n-1 (or a float in [0,1) without n).
+// e:random([n]): 0..n-1, or without n a whole number 0..2^31-1 (games index with
+// `e:random() % m + 1`: NUKITASHI's system voices, Memory's Dogma's screen shakes).
 static int e_random(lua_State *L) {
     if (lua_gettop(L) >= 2 && lua_isnumber(L, 2)) {
         lua_Integer n = lua_tointeger(L, 2);
         lua_pushinteger(L, n > 0 ? (lua_Integer)(arc4random_uniform((unsigned)n)) : 0);
     } else {
-        lua_pushnumber(L, (lua_Number)arc4random() / 4294967296.0);
+        lua_pushinteger(L, (lua_Integer)(arc4random() & 0x7FFFFFFF));
     }
     return 1;
 }
@@ -352,6 +353,89 @@ static int artemis_read(lua_State *L) {
 }
 
 // Read-only io.open over the game's files (archives included), as Artemis provides.
+/// `pluto` (Lua table persistence), which the newer generation saves its system, global and
+/// config data and its saves with. The bytes only need to round-trip through Shiori, so this is
+/// a small data-only format of its own (numbers, strings, booleans, tables, shared and cyclic
+/// tables), read back without running any code.
+static const char *PLUTO_PRELUDE =
+    "pluto = {}\n"
+    "function pluto.persist(perms, root)\n"
+    "  local out, ids, n = {}, {}, 0\n"
+    "  local function put(v)\n"
+    "    local t = type(v)\n"
+    "    if t == \"number\" then\n"
+    "      if v ~= v then out[#out + 1] = \"nnan;\"\n"
+    "      elseif v == math.huge then out[#out + 1] = \"ninf;\"\n"
+    "      elseif v == -math.huge then out[#out + 1] = \"n-inf;\"\n"
+    "      else out[#out + 1] = \"n\" .. string.format(\"%.17g\", v) .. \";\" end\n"
+    "    elseif t == \"string\" then out[#out + 1] = \"s\" .. #v .. \":\" .. v\n"
+    "    elseif t == \"boolean\" then out[#out + 1] = v and \"b1\" or \"b0\"\n"
+    "    elseif t == \"table\" then\n"
+    "      if ids[v] then out[#out + 1] = \"r\" .. ids[v] .. \";\" return end\n"
+    "      n = n + 1\n"
+    "      ids[v] = n\n"
+    "      out[#out + 1] = \"t\"\n"
+    "      for k, x in pairs(v) do\n"
+    "        local kt, xt = type(k), type(x)\n"
+    "        if (kt == \"number\" or kt == \"string\" or kt == \"boolean\" or kt == \"table\")\n"
+    "          and (xt == \"number\" or xt == \"string\" or xt == \"boolean\" or xt == \"table\") then\n"
+    "          put(k)\n"
+    "          put(x)\n"
+    "        end\n"
+    "      end\n"
+    "      out[#out + 1] = \"e\"\n"
+    "    else out[#out + 1] = \"x\" end\n"
+    "  end\n"
+    "  put(root)\n"
+    "  return table.concat(out)\n"
+    "end\n"
+    "function pluto.unpersist(perms, s)\n"
+    "  if type(s) ~= \"string\" or s == \"\" then return nil end\n"
+    "  local pos, tables = 1, {}\n"
+    "  local get\n"
+    "  get = function()\n"
+    "    local c = string.sub(s, pos, pos)\n"
+    "    pos = pos + 1\n"
+    "    if c == \"n\" then\n"
+    "      local e = string.find(s, \";\", pos, true)\n"
+    "      local text = string.sub(s, pos, e - 1)\n"
+    "      pos = e + 1\n"
+    "      if text == \"nan\" then return 0 / 0 elseif text == \"inf\" then return math.huge elseif text == \"-inf\" then return -math.huge end\n"
+    "      return tonumber(text)\n"
+    "    elseif c == \"s\" then\n"
+    "      local e = string.find(s, \":\", pos, true)\n"
+    "      local len = tonumber(string.sub(s, pos, e - 1))\n"
+    "      local v = string.sub(s, e + 1, e + len)\n"
+    "      pos = e + 1 + len\n"
+    "      return v\n"
+    "    elseif c == \"b\" then\n"
+    "      local v = string.sub(s, pos, pos) == \"1\"\n"
+    "      pos = pos + 1\n"
+    "      return v\n"
+    "    elseif c == \"r\" then\n"
+    "      local e = string.find(s, \";\", pos, true)\n"
+    "      local id = tonumber(string.sub(s, pos, e - 1))\n"
+    "      pos = e + 1\n"
+    "      return tables[id]\n"
+    "    elseif c == \"t\" then\n"
+    "      local t = {}\n"
+    "      tables[#tables + 1] = t\n"
+    "      while string.sub(s, pos, pos) ~= \"e\" do\n"
+    "        if pos > #s then error(\"pluto: truncated data\") end\n"
+    "        local k = get()\n"
+    "        local v = get()\n"
+    "        if k ~= nil then t[k] = v end\n"
+    "      end\n"
+    "      pos = pos + 1\n"
+    "      return t\n"
+    "    elseif c == \"x\" then return nil end\n"
+    "    error(\"pluto: bad data at \" .. (pos - 1))\n"
+    "  end\n"
+    "  local ok, v = pcall(get)\n"
+    "  if ok then return v end\n"
+    "  return nil\n"
+    "end\n";
+
 static const char *IO_PRELUDE =
     "local read = __artemis_read\n"
     "__artemis_read = nil\n"
@@ -382,9 +466,27 @@ static const char *IO_PRELUDE =
     "end\n"
     "io.lines = function(path) local f = assert(io.open(path)); return f:lines() end\n";
 
+/// ARTEMIS_LUA_CALLS=1 (debugging): every Lua function call to stdout.
+/// ARTEMIS_LUA_LINES=<file part>: every line run in matching chunks.
+static void trace_calls(lua_State *L, lua_Debug *ar) {
+    if (ar->event == LUA_HOOKLINE) {
+        const char *filter = getenv("ARTEMIS_LUA_LINES");
+        if (lua_getinfo(L, "S", ar) && filter && strstr(ar->short_src, filter)) {
+            fprintf(stdout, "lua line %s:%d\n", ar->short_src, ar->currentline);
+        }
+        return;
+    }
+    if (getenv("ARTEMIS_LUA_CALLS") && lua_getinfo(L, "nS", ar) && ar->what[0] == 'L') {
+        fprintf(stdout, "lua call %s (%s:%d)\n", ar->name ? ar->name : "?", ar->short_src, ar->linedefined);
+    }
+}
+
 lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
+    if (getenv("ARTEMIS_LUA_CALLS") || getenv("ARTEMIS_LUA_LINES")) {
+        lua_sethook(L, trace_calls, (getenv("ARTEMIS_LUA_CALLS") ? LUA_MASKCALL : 0) | (getenv("ARTEMIS_LUA_LINES") ? LUA_MASKLINE : 0), 0);
+    }
     lua_pushlightuserdata(L, (void *)host);
     lua_setfield(L, LUA_REGISTRYINDEX, HOST_KEY);
 
@@ -419,6 +521,7 @@ lua_State *artemis_lua_open(const ArtemisLuaHost *host) {
     lua_pushcfunction(L, artemis_read);
     lua_setglobal(L, "__artemis_read");
     if (luaL_loadstring(L, IO_PRELUDE) == 0) lua_call(L, 0, 0);
+    if (luaL_loadstring(L, PLUTO_PRELUDE) == 0) lua_call(L, 0, 0);
     lua_pushcfunction(L, artemis_query);
     lua_setglobal(L, "__artemis_query");
     if (luaL_loadstring(L, LUA_PRELUDE) == 0) {
@@ -437,6 +540,20 @@ void artemis_lua_close(lua_State *L) {
 void artemis_lua_set_number(lua_State *L, const char *name, double value) {
     lua_pushnumber(L, value);
     lua_setglobal(L, name);
+}
+
+/// Error handler: the message with a Lua traceback (debug.traceback), so a failing call
+/// says where in the game's scripts it came from.
+static int add_traceback(lua_State *L) {
+    lua_getglobal(L, "debug");
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return 1; }
+    lua_getfield(L, -1, "traceback");
+    lua_remove(L, -2);
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return 1; }
+    lua_pushvalue(L, 1);
+    lua_pushinteger(L, 2);
+    lua_call(L, 2, 1);
+    return 1;
 }
 
 static char *pop_error(lua_State *L) {
@@ -491,7 +608,13 @@ char *artemis_lua_call(lua_State *L, const char *function, int count, const char
         lua_pushstring(L, values[i]);
         lua_setfield(L, -2, keys[i]);
     }
-    if (lua_pcall(L, 2, 0, 0) != 0) return pop_error(L);
+    // The handler sits under the function and its two arguments.
+    lua_pushcfunction(L, add_traceback);
+    lua_insert(L, -4);
+    int handler = lua_gettop(L) - 3;
+    int status = lua_pcall(L, 2, 0, handler);
+    lua_remove(L, handler);
+    if (status != 0) return pop_error(L);
     return NULL;
 }
 

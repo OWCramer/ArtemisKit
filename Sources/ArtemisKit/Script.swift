@@ -49,7 +49,8 @@ public struct ArtemisScript: Sendable {
 
     public init(path: String, data: Data, encoding: String.Encoding = artemisScriptEncoding) {
         self.path = path
-        let commands = ScriptParser.parse(data, encoding: encoding)
+        let commands = data.starts(with: Array("ASB\0".utf8))
+            ? ASBParser.parse(data, encoding: encoding) : ScriptParser.parse(data, encoding: encoding)
         self.commands = commands
         var labels: [String: Int] = [:]
         var nextBranch: [Int: Int] = [:]
@@ -95,6 +96,50 @@ public struct ArtemisScript: Sendable {
         self.nextBranch = nextBranch
         self.endIf = endIf
         self.loopPartner = loopPartner
+    }
+}
+
+/// The newer generation's compiled scripts (`.asb`, NUKITASHI's `system/ui.asb`): `ASB\0`, a
+/// byte, a u32 record count, then records, each a u32 kind: 1 a label (its name), 0 a tag (its name, its
+/// source line, a u32 attribute count, then name and value pairs). Strings are a u32 length,
+/// the bytes and a NUL. The same commands an `.iet` file parses to.
+enum ASBParser {
+    static func parse(_ data: Data, encoding: String.Encoding) -> [ScriptCommand] {
+        let bytes = [UInt8](data)
+        var position = 9
+        func u32() -> Int? {
+            guard position + 4 <= bytes.count else { return nil }
+            defer { position += 4 }
+            return Int(bytes[position]) | Int(bytes[position + 1]) << 8 | Int(bytes[position + 2]) << 16 | Int(bytes[position + 3]) << 24
+        }
+        func string() -> String? {
+            guard let length = u32(), length >= 0, position + length <= bytes.count else { return nil }
+            defer { position += length + 1 }
+            return decodeScriptText(Data(bytes[position..<(position + length)]), encoding: encoding)
+        }
+        var commands: [ScriptCommand] = []
+        var line = 0
+        while position < bytes.count {
+            guard let kind = u32() else { break }
+            switch kind {
+            case 1:
+                guard let name = string() else { return commands }
+                commands.append(ScriptCommand(kind: .label(name), line: line))
+            case 0:
+                guard let name = string(), let source = u32(), let count = u32(), count < 10_000 else { return commands }
+                line = source
+                var attributes: [(String, String)] = []
+                for _ in 0..<count {
+                    guard let key = string(), let value = string() else { return commands }
+                    attributes.append((key, value))
+                }
+                commands.append(ScriptCommand(kind: .tag(name: name, attributes: attributes), line: line))
+            default:
+                // Not seen yet: stop rather than misread the rest.
+                return commands
+            }
+        }
+        return commands
     }
 }
 
