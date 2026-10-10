@@ -2,6 +2,7 @@ import ArtemisKit
 import CoreGraphics
 import CoreText
 import Foundation
+import Metal
 import ImageIO
 
 // artemis-cli list <game folder>                     every visible file, with its source
@@ -155,6 +156,28 @@ case "extract":
         count += 1
     }
     print("extracted \(count) files to \(out.path)")
+case "shaders":
+    // artemis-cli shaders <game>: translates every GLSL shader the game ships to Metal and compiles it.
+    let device = MTLCreateSystemDefaultDevice()
+    var good = 0, bad = 0
+    for file in fs.files.values.sorted(by: { $0.path < $1.path }) where file.path.lowercased().hasSuffix(".glsl") {
+        let data = try fs.data(of: file)
+        guard let source = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .shiftJIS),
+              let program = ArtemisShaderProgram(glsl: source) else {
+            print("✗ \(file.path): didn't translate")
+            bad += 1
+            continue
+        }
+        do {
+            _ = try device?.makeLibrary(source: program.metalSource, options: nil)
+            print("✓ \(file.path): \(program.uniforms.map(\.name).joined(separator: ",")) | \(program.textures.joined(separator: ","))")
+            good += 1
+        } catch {
+            print("✗ \(file.path): \(error)")
+            bad += 1
+        }
+    }
+    print("\(good) compiled, \(bad) failed")
 case "run":
     let maxWaits = arguments.count > 2 ? Int(arguments[2]) ?? 50 : 50
     let maxSteps = arguments.count > 3 ? Int(arguments[3]) ?? 2_000_000 : 2_000_000
@@ -300,7 +323,9 @@ case "snapshot":
                 print("hit \(point): click \(player.stage.clickTarget(at: point)?.layer ?? "none"), rollover \(player.stage.eventTarget(at: point, type: "rollover") ?? "none")")
                 for (id, events) in player.stage.events where id.hasPrefix("1.80.120") { print("  events \(id): \(events.keys.sorted()) enabled \(events.values.map(\.enabled))") }
             }
-            guard let image = player.renderSnapshot() else { print("render failed"); return }
+            // ARTEMIS_METAL=1: through the Metal renderer the app uses, instead of Core Graphics.
+            let metal = ProcessInfo.processInfo.environment["ARTEMIS_METAL"] != nil
+            guard let image = metal ? metalSnapshot(player) : player.renderSnapshot() else { print("render failed"); return }
             let destination = CGImageDestinationCreateWithURL(output as CFURL, "public.png" as CFString, 1, nil)!
             CGImageDestinationAddImage(destination, image, nil)
             CGImageDestinationFinalize(destination)
@@ -312,4 +337,18 @@ case "snapshot":
 default:
     print("unknown command \(command)")
     exit(2)
+}
+
+
+/// The current frame through `ArtemisMetalRenderer`, read back.
+@MainActor
+func metalSnapshot(_ player: ArtemisPlayer) -> CGImage? {
+    guard let renderer = ArtemisMetalRenderer(),
+          let target = renderer.makeTarget(width: Int(player.stage.width), height: Int(player.stage.height), readable: true),
+          let buffer = renderer.queue.makeCommandBuffer() else { return nil }
+    renderer.render(stage: player.stage, texts: player.metalTexts(scale: 1), textsVisible: player.messageTextVisible,
+                    into: target, commandBuffer: buffer)
+    buffer.commit()
+    buffer.waitUntilCompleted()
+    return ArtemisMetalRenderer.image(from: target)
 }

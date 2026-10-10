@@ -255,7 +255,8 @@ public final class ArtemisInterpreter {
             break
         }
         let tag = try evaluate(name: name, rawAttributes)
-        if try filterTag(tag) { return }
+        // Tags in a queued frame came from Lua and went through the filter when issued.
+        if frames.last?.script.path != Self.queuePath, try filterTag(tag) { return }
         try perform(tag)
     }
 
@@ -287,6 +288,9 @@ public final class ArtemisInterpreter {
             host?.log("lua tag filter \(tag.name) (continuing): \(luaString(error, encoding))")
             free(error)
         }
+        // What the filter queued runs once its Lua returns, before the next command (the
+        // framework's [exkey]: a queued [@] that waits for the click it is named after).
+        if luaDepth == 0, defersLuaCalls, !holdingDeferredLua { flushDeferredLua() }
         return result == 1
     }
 
@@ -539,6 +543,13 @@ public final class ArtemisInterpreter {
     /// jumps to its `file`/`label`.
     /// With `interrupt`, the event fired during a wait that isn't a [stop] (a text wait):
     /// a call returns to that wait instead of re-running a command.
+    /// Whether an event handler fired during a non-[stop] wait runs as an interrupt that
+    /// returns to that wait (the newer generation's handler-only key and button events).
+    public func returnsToWait(_ attributes: [String: String], interrupt: Bool) -> Bool {
+        interrupt && defersLuaCalls && !frames.isEmpty && attributes["file"] == nil && attributes["label"] == nil
+            && attributes["call"] != "1"
+    }
+
     public func fireEvent(_ attributes: [String: String], interrupt: Bool = false) throws {
         let file = attributes["file"], label = attributes["label"]
         if file != nil || label != nil {
@@ -559,7 +570,16 @@ public final class ArtemisInterpreter {
         // the wait ([stop], or [@] beside text): NUKITASHI's buttons either only note the click
         // (`calllua btn_clickex`) or jump to a `popfuncNN` label that ends in `return`.
         var eventSerial = 0
-        if file == nil, label == nil, !interrupt, defersLuaCalls, !frames.isEmpty {
+        if returnsToWait(attributes, interrupt: interrupt) {
+            // During text or a timed wait: an empty frame to come back from. A handler that
+            // jumps (right-click's MWOFF: `jump ui.asb*msgoff`, which ends in `return`) runs
+            // in it; one that doesn't falls off its end. Either way the wait resumes.
+            eventSerials += 1
+            eventSerial = eventSerials
+            var frame = Frame(script: ArtemisScript(path: Self.queuePath, commands: []), pc: 0, locals: [:], isMacro: false, interrupt: true)
+            frame.event = eventSerial
+            frames.append(frame)
+        } else if file == nil, label == nil, !interrupt, defersLuaCalls, !frames.isEmpty {
             frames[frames.count - 1].pc = max(0, frames[frames.count - 1].pc - 1)
             eventSerials += 1
             eventSerial = eventSerials

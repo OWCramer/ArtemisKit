@@ -608,7 +608,7 @@ public final class ArtemisPlayer: ArtemisHost {
         switch wait {
         case .click, .stop, .time:
             let interrupt = wait != .stop
-            if interrupt, handler["call"] == "1" { savedWaits.append(wait) }
+            if interrupt, handler["call"] == "1" || interpreter.returnsToWait(handler, interrupt: true) { savedWaits.append(wait) }
             if !interrupt, handler["call"] != "1" { handler["call"] = "0" }
             wait = .none
             fire(handler, interrupt: interrupt)
@@ -884,10 +884,60 @@ public final class ArtemisPlayer: ArtemisHost {
         return context.makeImage()
     }
 
+    /// Message text as the Metal renderer draws it: each layer's text drawn over the stage at
+    /// `scale` (redrawn when the layer changes), and how much of it has typed out.
+    public func metalTexts(scale: Double) -> [ArtemisMetalRenderer.Text] {
+        var texts: [ArtemisMetalRenderer.Text] = []
+        for (id, layer) in messages.layers.sorted(by: { $0.key < $1.key }) {
+            guard !layer.text.isEmpty, !layer.pageHidden else {
+                textImages[id] = nil
+                continue
+            }
+            let image: CGImage
+            if let cached = textImages[id], cached.revision == layer.revision, cached.scale == scale {
+                image = cached.image
+            } else {
+                guard let drawn = textRenderer.image(for: layer, stageWidth: stage.width, stageHeight: stage.height, scale: scale)
+                else { continue }
+                textImages[id] = (layer.revision, scale, drawn)
+                image = drawn
+            }
+            let count = Int(layer.revealed)
+            let reveal = count >= layer.text.count ? nil : textRenderer.revealRects(for: layer, count: count)
+            texts.append(ArtemisMetalRenderer.Text(id: id, image: image, reveal: reveal, layered: layer.layered))
+        }
+        return texts
+    }
+    private var textImages: [String: (revision: Int, scale: Double, image: CGImage)] = [:]
+
+    /// Text that isn't layered shows only while its window does (the message layers' parent, 80).
+    public var messageTextVisible: Bool { stage.layer("80").map(\.visible) ?? true }
+
+    /// A pixel shader `lyshader` names, as Metal. Windows builds load HLSL (`system/shader/pc`)
+    /// or compiled shaders; the same effects ship as GLSL ES for the mobile and Switch builds
+    /// (`mb`, `sw`), which translate. Nil when there's none (built-in effects stand in).
+    private func shaderProgram(file: String) -> ArtemisShaderProgram? {
+        let path = file.replacingOccurrences(of: "\\", with: "/")
+        let name = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        let folder = (path as NSString).deletingLastPathComponent
+        var candidates = [folder + "/" + name + ".glsl"]
+        for platform in ["mb", "sw"] { candidates.append("system/shader/\(platform)/\(name).glsl") }
+        for candidate in candidates {
+            guard let data = try? fileSystem.data(candidate), let source = String(data: data, encoding: .utf8)
+                    ?? String(data: data, encoding: .shiftJIS) else { continue }
+            if let program = ArtemisShaderProgram(glsl: source) { return program }
+            record("shader \(candidate) didn't translate")
+        }
+        return nil
+    }
+
     public func perform(_ tag: ArtemisTag, interpreter: ArtemisInterpreter) -> ArtemisTagOutcome {
         switch tag.name {
         case "lyc":
             stage.create(tag)
+        case "lyshader":
+            guard let id = tag["id"] else { break }
+            stage.shaderPrograms[id] = tag["file"].flatMap(shaderProgram(file:))
         case "lyprop":
             if let id = tag["id"], id.hasPrefix("~") {
                 // A message layer ("~" alone is the default one).
@@ -1293,8 +1343,6 @@ public final class ArtemisPlayer: ArtemisHost {
         "uidel", "avoid", "statusbar",
         "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
-        // The newer generation loads its pixel shaders by name; `lyprop shader=` applies them.
-        "lyshader",
     ]
 
     // MARK: Click-wait glyph

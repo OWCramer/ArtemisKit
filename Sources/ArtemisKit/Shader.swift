@@ -10,6 +10,8 @@ import Foundation
 public struct ArtemisShader: Equatable, Sendable {
     public var name: String
     public var values: [String: String]
+    /// `shadertexture`: extra samplers by name (`textureUser`) and the layers they show.
+    public var textures: [String: String] = [:]
 
     var key: String { name + "(" + values.keys.sorted().map { "\($0)=\(values[$0] ?? "")" }.joined(separator: ",") + ")" }
 

@@ -52,6 +52,9 @@ public final class ArtemisLayer {
     /// "tone" parent, a blur on a "blurx"/"blury" one).
     public var shader: ArtemisShader?
     public internal(set) var inheritedShaders: [ArtemisShader] = []
+    /// `intermediate_render`: the layer and its children draw offscreen first, and its
+    /// shader and colour effects apply to the result.
+    public var intermediateRender = false
     /// `clickablethreshold`: events fire only where the image's alpha reaches this.
     public var clickThreshold: Double?
     /// `draggable` / `dragarea` (left, top, right, bottom the layer stays within).
@@ -72,6 +75,20 @@ public final class ArtemisLayer {
     }
     private var processed: CGImage?
     private var processedKey: String?
+
+    /// The image with only its mask applied: the Metal renderer does colour effects and
+    /// shaders on the GPU (cached).
+    public var maskedImage: CGImage? {
+        guard let image else { return nil }
+        guard let mask else { return image }
+        let key = "\(ObjectIdentifier(image))|\(ObjectIdentifier(mask))"
+        if key == maskedKey, let masked { return masked }
+        masked = ArtemisLayer.process(image, negative: false, grayscale: false, multiply: 0xFFFFFF, mask: mask)
+        maskedKey = key
+        return masked
+    }
+    private var masked: CGImage?
+    private var maskedKey: String?
 
     private static let ciContext = CIContext(options: [.cacheIntermediates: false])
 
@@ -111,7 +128,7 @@ public final class ArtemisLayer {
 
     /// Alpha (0...255) of the shown image at a point in layer pixels; 255 for colour layers.
     func alpha(at point: CGPoint) -> Double {
-        guard let image = displayImage else { return 255 }
+        guard let image = maskedImage else { return 255 }
         let x = Int(point.x + (clip?.minX ?? 0)), y = Int(point.y + (clip?.minY ?? 0))
         guard x >= 0, y >= 0, x < image.width, y < image.height else { return 0 }
         var pixel: [UInt8] = [0, 0, 0, 0]
@@ -317,6 +334,8 @@ public final class ArtemisStage {
     public private(set) var events: [String: [String: ArtemisLayerEvent]] = [:]
     /// Bumped on flip/trans: the presenter shows changes then (with a transition for trans).
     public private(set) var presentationCount = 0
+    /// Pixel shaders loaded by `lyshader`, by the id `lyprop shader=` names.
+    public var shaderPrograms: [String: ArtemisShaderProgram] = [:]
     public private(set) var lastTransition: (type: String, duration: Double, rule: String?, vague: Double)?
 
     private var imageCache: [String: CGImage] = [:]
@@ -445,7 +464,7 @@ public final class ArtemisStage {
         layer.image = nil; layer.color = nil; layer.file = nil; layer.video = nil
         layer.reverseX = false; layer.reverseY = false; layer.clip = nil; layer.blendMode = "normal"
         layer.negative = false; layer.grayscale = false; layer.colorMultiply = 0xFFFFFF; layer.mask = nil
-        layer.shader = nil
+        layer.shader = nil; layer.intermediateRender = false
         layer.clickThreshold = nil; layer.draggable = false; layer.dragArea = nil; layer.anime = nil
         if let mask = tag["mask"], !mask.isEmpty { layer.mask = image(mask) }
         tweens.removeAll { $0.layer == id }
@@ -529,9 +548,14 @@ public final class ArtemisStage {
             let names = (tag["shaderconstant"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             var values: [String: String] = [:]
             for key in names { values[key] = tag[key] }
-            layer.shader = name.isEmpty || name == "reset" ? nil : ArtemisShader(name: name, values: values)
+            var textures: [String: String] = [:]
+            for key in (tag["shadertexture"] ?? "").split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+                textures[key] = tag[key]
+            }
+            layer.shader = name.isEmpty || name == "reset" ? nil : ArtemisShader(name: name, values: values, textures: textures)
             shadersChanged = true
         }
+        if let value = tag["intermediate_render"] { layer.intermediateRender = value == "1" }
         if let value = tag["clickablethreshold"] { layer.clickThreshold = ArtemisValue.number(from: value) }
         if let value = tag["draggable"] { layer.draggable = value == "1" }
         if let area = numbers("dragarea") { layer.dragArea = area.count == 4 ? CGRect(x: area[0], y: area[1], width: area[2] - area[0], height: area[3] - area[1]) : nil }
@@ -635,7 +659,7 @@ public final class ArtemisStage {
     /// Advances tweens to `time` (ms). Finished ones land on their end value.
     /// A shader was set or cleared since the last update; `shadersActive`: some layer has one.
     private var shadersChanged = false
-    private var shadersActive = false
+    public private(set) var shadersActive = false
     func markShadersChanged() { shadersChanged = true }
 
     /// Hands each layer the shaders of the layers it sits in, nearest first. Walks the tree
