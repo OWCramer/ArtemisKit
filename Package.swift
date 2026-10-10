@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "ArtemisKit",
-    platforms: [.iOS(.v18), .macOS(.v15)],
+    platforms: [.iOS(.v18), .macOS(.v15), .tvOS(.v18)],
     products: [
         .library(name: "ArtemisKit", targets: ["ArtemisKit"]),
         .executable(name: "artemis-cli", targets: ["artemis-cli"]),
