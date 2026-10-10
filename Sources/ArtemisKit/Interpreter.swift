@@ -304,6 +304,12 @@ public final class ArtemisInterpreter {
     private func perform(_ tag: ArtemisTag, filterUnhandled: Bool) throws {
         switch tag.name {
         case "call":
+            // As with jumps, a call to a label the game doesn't ship (Ne no Kami's CG gallery
+            // calls *disp_achievement, which only its Steam build's engine knew) is skipped.
+            guard (try? target(file: tag["file"], label: tag["label"])) != nil else {
+                host?.log("call to missing \(tag["file"] ?? "") *\(tag["label"] ?? "") at \(location); continuing")
+                return
+            }
             try call(file: tag["file"], label: tag["label"], locals: [:], isMacro: false)
         case "jump":
             try jump(file: tag["file"], label: tag["label"])

@@ -156,6 +156,35 @@ public final class ArtemisMetalRenderer {
             cached.lastUsed = frameNumber
             return cached.texture
         }
+        guard let texture = Self.makeTexture(image, device: device) else { return nil }
+        textures[key] = CachedTexture(image: image, texture: texture, lastUsed: frameNumber)
+        return texture
+    }
+
+    private var prefetching: Set<ObjectIdentifier> = []
+
+    /// Decodes and uploads pictures on a background thread, so a flip-book's frames (NUKITASHI's
+    /// 1600×900 smoke) don't each cost a decode on the main thread the first time round.
+    public func prefetch(_ images: [CGImage]) {
+        let wanted = images.filter { textures[ObjectIdentifier($0)] == nil && !prefetching.contains(ObjectIdentifier($0)) }
+        guard !wanted.isEmpty else { return }
+        for image in wanted { prefetching.insert(ObjectIdentifier(image)) }
+        let device = self.device
+        DispatchQueue.global(qos: .userInitiated).async {
+            let made = wanted.compactMap { image in Self.makeTexture(image, device: device).map { (image, $0) } }
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    for (image, texture) in made where self.textures[ObjectIdentifier(image)] == nil {
+                        self.textures[ObjectIdentifier(image)] = CachedTexture(image: image, texture: texture, lastUsed: self.frameNumber)
+                    }
+                    for image in wanted { self.prefetching.remove(ObjectIdentifier(image)) }
+                }
+            }
+        }
+    }
+
+    nonisolated private static func makeTexture(_ image: CGImage, device: MTLDevice) -> MTLTexture? {
         let width = image.width, height = image.height
         guard width > 0, height > 0 else { return nil }
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
@@ -167,7 +196,6 @@ public final class ArtemisMetalRenderer {
               let data = context.data else { return nil }
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: data, bytesPerRow: width * 4)
-        textures[key] = CachedTexture(image: image, texture: texture, lastUsed: frameNumber)
         return texture
     }
 
@@ -201,7 +229,9 @@ public final class ArtemisMetalRenderer {
         generations.append(inFlight)
         inFlight = []
         while generations.count > 3 { pool.append(contentsOf: generations.removeFirst()) }
-        if pool.count > 8 { pool.removeFirst(pool.count - 8) }
+        // Enough for every group of a busy scene (NUKITASHI nests blur, tone and shader
+        // groups), so steady frames allocate nothing.
+        if pool.count > 24 { pool.removeFirst(pool.count - 24) }
     }
 
     /// A texture the renderer can draw into and sample, `width`×`height` pixels.
@@ -253,15 +283,21 @@ public final class ArtemisMetalRenderer {
         var encoder: MTLRenderCommandEncoder
         let buffer: MTLCommandBuffer
         let stage: ArtemisStage
-        let layeredTexts: [String: Text]
+        let layeredTexts: [String: [Text]]
     }
 
     /// Draws `stage` (and `texts`) into `target`, which covers the whole stage.
+    /// Offscreen groups the last `render` drew (performance checks).
+    public private(set) var lastGroupCount = 0
+    private var groupCount = 0
+
     public func render(stage: ArtemisStage, texts: [Text], textsVisible: Bool, into target: MTLTexture,
                        commandBuffer: MTLCommandBuffer) {
         trimTextures()
+        groupCount = 0
+        defer { lastGroupCount = groupCount }
         guard let encoder = begin(target, buffer: commandBuffer, load: .clear) else { return }
-        let layered = Dictionary(texts.filter(\.layered).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let layered = Dictionary(grouping: texts.filter(\.layered), by: \.id)
         var frame = Frame(target: target, stageSize: CGSize(width: stage.width, height: stage.height), encoder: encoder,
                           buffer: commandBuffer, stage: stage, layeredTexts: layered)
         for child in stage.root.children { draw(child, transform: .identity, opacity: 1, frame: &frame) }
@@ -322,6 +358,7 @@ public final class ArtemisMetalRenderer {
         let grouped = layer.shader != nil
             || (layer.intermediateRender && !layer.children.isEmpty && (Self.hasColorEffects(layer) || layer.alpha < 255))
         if grouped, let group = scratch(like: frame.target) {
+            groupCount += 1
             frame.encoder.endEncoding()
             guard let groupEncoder = begin(group, buffer: frame.buffer, load: .clear) else { return }
             var groupFrame = Frame(target: group, stageSize: frame.stageSize, encoder: groupEncoder, buffer: frame.buffer,
@@ -366,8 +403,8 @@ public final class ArtemisMetalRenderer {
             quad(rect, uv: uv, transform: transform, texture: texture, uniforms: uniforms, blend: layer.blendMode,
                  stageSize: frame.stageSize, encoder: frame.encoder)
         }
-        if let id = layer.messageLayer, let text = frame.layeredTexts[id] {
-            drawText(text, transform: transform, opacity: alpha, frame: frame)
+        if let id = layer.messageLayer {
+            for text in frame.layeredTexts[id] ?? [] { drawText(text, transform: transform, opacity: alpha, frame: frame) }
         }
         for child in layer.children { draw(child, transform: transform, opacity: alpha, frame: &frame) }
     }

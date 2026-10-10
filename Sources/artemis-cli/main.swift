@@ -287,6 +287,11 @@ case "snapshot":
                     guard !taps.isEmpty else { break loop }
                     let tap = taps.removeFirst()
                     print("tap \(tap) at \(player.interpreter.location) (\(player.wait))")
+                    // ARTEMIS_TEXTS=1: the text on screen at each tap.
+                    if ProcessInfo.processInfo.environment["ARTEMIS_TEXTS"] != nil {
+                        for (id, layer) in player.messages.layers where !layer.text.trimmingCharacters(in: .whitespaces).isEmpty
+                            && !id.hasPrefix("basefont") { print("  text \(id): \(layer.text.prefix(60))") }
+                    }
                     let tappedText = player.wait == .click
                     autoreleasepool { if tap.x < 0 { player.rightClick() } else { player.tap(at: tap) } }
                     // ARTEMIS_SKIP=1: skip mode after each tap on text (it stops at choices; a
@@ -343,6 +348,10 @@ default:
 /// The current frame through `ArtemisMetalRenderer`, read back.
 @MainActor
 func metalSnapshot(_ player: ArtemisPlayer) -> CGImage? {
+    // ARTEMIS_REVEAL=n: the text as it looks n characters into typing.
+    if let count = ProcessInfo.processInfo.environment["ARTEMIS_REVEAL"].flatMap(Double.init) {
+        for layer in player.messages.layers.values where !layer.text.isEmpty { layer.revealed = count }
+    }
     guard let renderer = ArtemisMetalRenderer(),
           let target = renderer.makeTarget(width: Int(player.stage.width), height: Int(player.stage.height), readable: true),
           let buffer = renderer.queue.makeCommandBuffer() else { return nil }
@@ -350,5 +359,31 @@ func metalSnapshot(_ player: ArtemisPlayer) -> CGImage? {
                     into: target, commandBuffer: buffer)
     buffer.commit()
     buffer.waitUntilCompleted()
+    // ARTEMIS_METAL_BENCH=n: renders the frame n more times at the iPhone Air's drawable size
+    // (2240×1260), advancing animations 33 ms each, and reports the time per frame.
+    if let runs = ProcessInfo.processInfo.environment["ARTEMIS_METAL_BENCH"].flatMap(Int.init),
+       let big = renderer.makeTarget(width: 2240, height: 1260) {
+        var cpu = 0.0, gpu = 0.0, step = 0.0, texts = 0.0
+        var clock = player.now
+        for _ in 0 ..< runs {
+            clock += 16.7
+            let updateStart = Date()
+            player.update(time: clock)
+            step += Date().timeIntervalSince(updateStart)
+            let textStart = Date()
+            _ = player.metalTexts(scale: 1.4)
+            texts += Date().timeIntervalSince(textStart)
+            let start = Date()
+            guard let frame = renderer.queue.makeCommandBuffer() else { break }
+            renderer.render(stage: player.stage, texts: player.metalTexts(scale: 1.4), textsVisible: false, into: big, commandBuffer: frame)
+            frame.commit()
+            cpu += Date().timeIntervalSince(start)
+            frame.waitUntilCompleted()
+            gpu += frame.gpuEndTime - frame.gpuStartTime
+        }
+        print(String(format: "metal bench: update %.2f ms, texts %.2f ms, render %.2f ms CPU, %.2f ms GPU per frame, %d groups",
+                     step / Double(runs) * 1000, texts / Double(runs) * 1000, cpu / Double(runs) * 1000,
+                     gpu / Double(runs) * 1000, renderer.lastGroupCount))
+    }
     return ArtemisMetalRenderer.image(from: target)
 }

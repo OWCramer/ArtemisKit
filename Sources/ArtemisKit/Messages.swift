@@ -572,13 +572,16 @@ public final class ArtemisTextRenderer {
         return lines
     }
 
-    /// Draws `layer`'s text into `context` (top-left origin, stage pixels).
-    public func draw(_ layer: ArtemisMessages.Layer, in context: CGContext) {
+    /// Draws `layer`'s text into `context` (top-left origin, stage pixels). `parity`: only the
+    /// even (0) or odd (1) lines, so a reveal that reaches below one line never uncovers the
+    /// next (NUKITASHI's lines overlap: its pitch is shorter than ascent plus descent).
+    public func draw(_ layer: ArtemisMessages.Layer, in context: CGContext, parity: Int? = nil) {
         guard layer.visible, !layer.pageHidden, !layer.runs.isEmpty, layer.alpha > 0 else { return }
         context.saveGState()
         defer { context.restoreGState() }
         context.setAlpha(layer.alpha / 255)
-        let lines = layout(layer, string: attributed(layer, pass: .measure))
+        let all = layout(layer, string: attributed(layer, pass: .measure))
+        let lines = parity.map { p in all.enumerated().filter { $0.offset % 2 == p }.map(\.element) } ?? all
         func pass(_ pass: Pass, offset: Double) {
             let string = attributed(layer, pass: pass)
             for line in lines {
@@ -704,9 +707,10 @@ public final class ArtemisTextRenderer {
 
     /// Rectangles covering the first `count` characters, for revealing text gradually with
     /// a mask over a fully drawn page (margins for outlines and ruby).
-    public func revealRects(for layer: ArtemisMessages.Layer, count: Int) -> [CGRect] {
+    public func revealRects(for layer: ArtemisMessages.Layer, count: Int, parity: Int? = nil) -> [CGRect] {
         let target = utf16Offset(layer.text, characters: count)
-        let lines = layout(layer, string: attributed(layer, pass: .measure))
+        let all = layout(layer, string: attributed(layer, pass: .measure))
+        let lines = parity.map { p in all.enumerated().filter { $0.offset % 2 == p }.map(\.element) } ?? all
         return rects(layer, lines: lines, from: 0, to: target).map { $0.insetBy(dx: -8, dy: -6) }
     }
 
@@ -716,14 +720,15 @@ public final class ArtemisTextRenderer {
     }
 
     /// The layer's text as a transparent stage-sized image (for presenters that composite).
-    public func image(for layer: ArtemisMessages.Layer, stageWidth: Double, stageHeight: Double, scale: Double = 1) -> CGImage? {
+    public func image(for layer: ArtemisMessages.Layer, stageWidth: Double, stageHeight: Double, scale: Double = 1,
+                      parity: Int? = nil) -> CGImage? {
         let w = Int(stageWidth * scale), h = Int(stageHeight * scale)
         guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         context.translateBy(x: 0, y: CGFloat(h))
         context.scaleBy(x: scale, y: -scale)
-        draw(layer, in: context)
+        draw(layer, in: context, parity: parity)
         return context.makeImage()
     }
 }

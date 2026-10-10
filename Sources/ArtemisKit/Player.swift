@@ -885,7 +885,9 @@ public final class ArtemisPlayer: ArtemisHost {
     }
 
     /// Message text as the Metal renderer draws it: each layer's text drawn over the stage at
-    /// `scale` (redrawn when the layer changes), and how much of it has typed out.
+    /// `scale` (redrawn when the layer changes), and how much of it has typed out. A page
+    /// still typing comes as two images, its even and its odd lines, so revealing one line
+    /// down to its descenders can't uncover the line under it.
     public func metalTexts(scale: Double) -> [ArtemisMetalRenderer.Text] {
         var texts: [ArtemisMetalRenderer.Text] = []
         for (id, layer) in messages.layers.sorted(by: { $0.key < $1.key }) {
@@ -893,18 +895,25 @@ public final class ArtemisPlayer: ArtemisHost {
                 textImages[id] = nil
                 continue
             }
-            let image: CGImage
-            if let cached = textImages[id], cached.revision == layer.revision, cached.scale == scale {
-                image = cached.image
-            } else {
-                guard let drawn = textRenderer.image(for: layer, stageWidth: stage.width, stageHeight: stage.height, scale: scale)
-                else { continue }
-                textImages[id] = (layer.revision, scale, drawn)
-                image = drawn
-            }
             let count = Int(layer.revealed)
-            let reveal = count >= layer.text.count ? nil : textRenderer.revealRects(for: layer, count: count)
-            texts.append(ArtemisMetalRenderer.Text(id: id, image: image, reveal: reveal, layered: layer.layered))
+            let typing = count < layer.text.count
+            let parities: [Int?] = typing ? [0, 1] : [nil]
+            for parity in parities {
+                let key = id + (parity.map { "#\($0)" } ?? "")
+                let image: CGImage
+                if let cached = textImages[key], cached.revision == layer.revision, cached.scale == scale {
+                    image = cached.image
+                } else {
+                    guard let drawn = textRenderer.image(for: layer, stageWidth: stage.width, stageHeight: stage.height,
+                                                         scale: scale, parity: parity) else { continue }
+                    textImages[key] = (layer.revision, scale, drawn)
+                    image = drawn
+                }
+                let reveal = typing ? textRenderer.revealRects(for: layer, count: count, parity: parity) : nil
+                texts.append(ArtemisMetalRenderer.Text(id: id, image: image, reveal: reveal, layered: layer.layered))
+            }
+            // Drop the other form's images once a page finishes typing or starts again.
+            for key in typing ? [id] : [id + "#0", id + "#1"] { textImages[key] = nil }
         }
         return texts
     }

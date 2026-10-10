@@ -752,6 +752,12 @@ public final class ArtemisStage {
 
     private var animeLayers: Set<String> = []
 
+    /// Every frame of the flip-books on the stage (to prepare ahead of showing them).
+    public var animeFrameImages: [CGImage] {
+        animeLayers.compactMap { layer($0) }.filter { $0.mask == nil }
+            .flatMap { $0.anime?.frames.compactMap(\.image) ?? [] }
+    }
+
     private func frame(_ tag: ArtemisTag, time: Double) -> ArtemisAnime.Frame {
         var properties = tag.attributes
         for key in ["id", "mode", "file", "mask", "time", "loop"] { properties[key] = nil }
