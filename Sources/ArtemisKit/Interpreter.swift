@@ -499,7 +499,7 @@ public final class ArtemisInterpreter {
     // MARK: Save state
 
     func savedFrames(upTo limit: Int? = nil) -> [ArtemisSaveState.Frame] {
-        frames.prefix(limit ?? frames.count).map {
+        frames.prefix(limit ?? frames.count).filter { $0.script.path != Self.queuePath }.map {
             .init(file: $0.script.path, pc: $0.pc, locals: $0.locals, isMacro: $0.isMacro,
                   interrupt: $0.interrupt, rightClick: $0.rightClick)
         }
@@ -880,8 +880,19 @@ public final class ArtemisInterpreter {
             let tag = queuedTags.removeFirst()
             if Self.traceLua { host?.log("trace: queued \(tag.name) at \(location)") }
             do { try perform(tag) } catch { host?.log("queued tag \(tag.name): \(error)") }
+            // A queued tag that waits (the framework's stop2(): a dialog's [stop]) and the tags
+            // queued after it go into a frame of their own, as script: an event during the wait
+            // re-runs the waiting tag as it would a script command, and when the wait ends the
+            // rest of the queue runs in order before the script it was queued from goes on.
+            if defersLuaCalls, case .waiting = state {
+                pushQueueFrame([tag] + queuedTags)
+                queuedTags.removeAll()
+            }
         }
     }
+
+    /// The path of those frames; saves leave them out (a load resumes the script they came from).
+    static let queuePath = "~queued"
 
     private static let unitSeparator = "\u{1F}", recordSeparator = "\u{1E}"
 
@@ -1117,7 +1128,7 @@ public final class ArtemisInterpreter {
                 // A wait requested from inside Lua can't suspend Lua; carry on. The newer
                 // generation's framework relies on it taking effect once Lua returns.
                 if case .waiting = state, case .running = previous {
-                    if defersLuaCalls, luaDepth > 0 { deferredLuaWait = state }
+                    if defersLuaCalls, luaDepth > 0 { deferredLuaWait = state; deferredLuaWaitTag = tag }
                     state = .running
                 }
             }
@@ -1149,6 +1160,18 @@ public final class ArtemisInterpreter {
     private var holdingDeferredLua = false
     private var deferredLuaCalls: [(file: String?, label: String?)] = []
     private var deferredLuaWait: State?
+    /// The tag that started it (a dialog's e:tag{"stop"} inside estag_call).
+    private var deferredLuaWaitTag: ArtemisTag?
+
+    /// Puts tags that waited outside the script (queued, or from Lua) in a frame of their own,
+    /// as script, so an event during the wait re-runs the waiting tag as it would a script
+    /// command, and what follows runs in order when the wait ends.
+    private func pushQueueFrame(_ tags: [ArtemisTag]) {
+        let commands = tags.map { tag in
+            ScriptCommand(kind: .tag(name: tag.name, attributes: tag.order.map { ($0, tag[$0] ?? "") }), line: 0)
+        }
+        frames.append(Frame(script: ArtemisScript(path: Self.queuePath, commands: commands), pc: 1, locals: [:], isMacro: false))
+    }
 
     /// After the outermost Lua call: the tags it queued with `e:enqueueTag` (run now, as the
     /// engine runs them once Lua returns), the calls it made (first one on top), then its wait.
@@ -1163,7 +1186,11 @@ public final class ArtemisInterpreter {
         }
         if let wait = deferredLuaWait {
             deferredLuaWait = nil
-            if case .running = state { state = wait }
+            if case .running = state {
+                state = wait
+                if let tag = deferredLuaWaitTag { pushQueueFrame([tag]) }
+            }
+            deferredLuaWaitTag = nil
         }
     }
 

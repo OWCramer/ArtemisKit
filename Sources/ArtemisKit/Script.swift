@@ -48,9 +48,13 @@ public struct ArtemisScript: Sendable {
     let loopPartner: [Int: Int]
 
     public init(path: String, data: Data, encoding: String.Encoding = artemisScriptEncoding) {
+        self.init(path: path, commands: data.starts(with: Array("ASB\0".utf8))
+            ? ASBParser.parse(data, encoding: encoding) : ScriptParser.parse(data, encoding: encoding))
+    }
+
+    /// A script made of commands directly (the tags queued after one that waits).
+    init(path: String, commands: [ScriptCommand]) {
         self.path = path
-        let commands = data.starts(with: Array("ASB\0".utf8))
-            ? ASBParser.parse(data, encoding: encoding) : ScriptParser.parse(data, encoding: encoding)
         self.commands = commands
         var labels: [String: Int] = [:]
         var nextBranch: [Int: Int] = [:]
