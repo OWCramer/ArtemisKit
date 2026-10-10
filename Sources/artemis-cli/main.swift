@@ -122,6 +122,12 @@ case "font":
         let sample = arguments.count > 3 ? arguments[3] : "Who should"
         let size = arguments.count > 4 ? Double(arguments[4]) ?? 30 : 30
         let font = CTFontCreateWithFontDescriptor(descriptor, size, nil)
+        if let os2 = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?, os2.count >= 78 {
+            func i16(_ o: Int) -> Int { Int(Int16(bitPattern: UInt16(os2[os2.startIndex + o]) << 8 | UInt16(os2[os2.startIndex + o + 1]))) }
+            func u16(_ o: Int) -> Int { Int(UInt16(os2[os2.startIndex + o]) << 8 | UInt16(os2[os2.startIndex + o + 1])) }
+            print("unitsPerEm \(CTFontGetUnitsPerEm(font)); typo ascender \(i16(68)) descender \(i16(70)) lineGap \(i16(72)); win ascent \(u16(74)) descent \(u16(76))")
+        }
+        print("CoreText ascent \(CTFontGetAscent(font)) descent \(CTFontGetDescent(font)) leading \(CTFontGetLeading(font)) cap \(CTFontGetCapHeight(font)) at size \(size)")
         let glyphs = Array(sample.utf16)
         var ids = [CGGlyph](repeating: 0, count: glyphs.count)
         CTFontGetGlyphsForCharacters(font, glyphs, &ids, glyphs.count)

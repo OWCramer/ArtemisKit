@@ -399,7 +399,15 @@ public final class ArtemisTextRenderer {
                     }
                 }
             }
-            if let descriptor = fonts[face] { return CTFontCreateWithFontDescriptor(descriptor, size, nil) }
+            if let descriptor = fonts[face] {
+                let font = CTFontCreateWithFontDescriptor(descriptor, size, nil)
+                // The older generation takes `size` as Windows' cell height (a positive GDI
+                // lfHeight: ascent plus descent), so the glyphs are smaller than `size` px:
+                // Memory's Dogma's official screenshots set its English lines at Nasu ~29 px
+                // for size 40. The newer generation's size is the em (NUKITASHI's screenshots).
+                guard !newerGeneration, let cell = Self.winCellHeight(font), cell > 0 else { return font }
+                return CTFontCreateWithFontDescriptor(descriptor, size * size / cell, nil)
+            }
             // An OS font by name (the engine falls back to these on iOS too).
             let system = CTFontCreateWithName(face as CFString, size, nil)
             if (CTFontCopyPostScriptName(system) as String).lowercased().contains(face.lowercased().prefix(4)) { return system }
@@ -409,10 +417,19 @@ public final class ArtemisTextRenderer {
 
     private func font(_ spec: ArtemisMessages.Font) -> CTFont { font(spec.face, size: spec.size) }
 
-    /// The text row's ascent and height from the font's OS/2 typographic metrics (ascender,
-    /// descender, line gap), as the engine measures lines: Memory's Dogma's choice rows and
-    /// Ne no Kami's official screenshots both match these, not the hhea metrics CoreText
-    /// reports. Falls back to CoreText's metrics for fonts without an OS/2 table.
+    /// Windows' line height (usWinAscent + usWinDescent) for the font at its size.
+    static func winCellHeight(_ font: CTFont) -> Double? {
+        guard let table = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?, table.count >= 78 else { return nil }
+        func uint16(_ offset: Int) -> Double { Double(UInt16(table[table.startIndex + offset]) << 8 | UInt16(table[table.startIndex + offset + 1])) }
+        let unitsPerEm = Double(CTFontGetUnitsPerEm(font))
+        let sum = uint16(74) + uint16(76)
+        guard unitsPerEm > 0, sum > 0 else { return nil }
+        return sum * CTFontGetSize(font) / unitsPerEm
+    }
+
+    /// The text row's ascent and height. With `win`, Windows' cell (usWinAscent and
+    /// usWinDescent), which both generations use; otherwise the OS/2 typographic metrics.
+    /// Falls back to CoreText's metrics for fonts without an OS/2 table.
     static func lineMetrics(_ font: CTFont, size: Double, win: Bool = false) -> (ascent: Double, height: Double) {
         if let table = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?, table.count >= 74 {
             func int16(_ offset: Int) -> Double {
@@ -485,8 +502,9 @@ public final class ArtemisTextRenderer {
                 break
             }
             let piece = NSMutableAttributedString(string: run.text, attributes: attributes)
-            if newerGeneration, spec.kerning != 0 {
-                // Only full-width characters are tightened.
+            if spec.kerning != 0 {
+                // Only full-width characters are tightened (both generations: Memory's Dogma's
+                // English lines are their natural width despite kerning="-3").
                 var offset = 0
                 for character in run.text {
                     let length = character.utf16.count
@@ -516,7 +534,7 @@ public final class ArtemisTextRenderer {
     /// CoreText stroke width (percent of the font size) for an outline `outlineWidth` px wide
     /// on each side.
     private func outlineStroke(_ spec: ArtemisMessages.Font) -> Double {
-        max(1, spec.outlineWidth) * 2 / max(1, spec.size) * 100
+        max(1, spec.outlineWidth) * 2 / max(1, CTFontGetSize(font(spec))) * 100
     }
 
     /// Lays text out the engine's way: wrapped to `width`, every line `linePitch` tall,
@@ -528,7 +546,9 @@ public final class ArtemisTextRenderer {
         let text = string.string as NSString
         let typesetter = CTTypesetterCreateWithAttributedString(string)
         let length = text.length
-        let (ascent, textHeight) = Self.lineMetrics(ctFont, size: spec.size, win: newerGeneration)
+        // Both generations' text row is Windows' cell (win ascent + descent) of the font as
+        // drawn; for the older one that's `size` itself.
+        let (ascent, textHeight) = Self.lineMetrics(ctFont, size: CTFontGetSize(ctFont), win: true)
         let pitch = spec.linePitch(textHeight: textHeight)
         let pairs = indentPairs()
         var lines: [Line] = []
@@ -627,7 +647,8 @@ public final class ArtemisTextRenderer {
                 }
                 let rubyLine = CTLineCreateWithAttributedString(NSAttributedString(string: ruby, attributes: attributes))
                 let rubyWidth = CTLineGetTypographicBounds(rubyLine, nil, nil, nil)
-                let (rubyAscent, _) = Self.lineMetrics(font(spec.rubyFace ?? spec.face, size: rubySize), size: rubySize, win: newerGeneration)
+                let rubyFont = font(spec.rubyFace ?? spec.face, size: rubySize)
+                let (rubyAscent, _) = Self.lineMetrics(rubyFont, size: CTFontGetSize(rubyFont), win: true)
                 context.saveGState()
                 context.translateBy(x: line.x + (x0 + x1) / 2 - rubyWidth / 2, y: line.top + spec.spaceTop + rubyAscent)
                 context.scaleBy(x: 1, y: -1)
