@@ -2,14 +2,50 @@ import Accelerate
 import CoreGraphics
 import CVideo
 import Foundation
+import ImageIO
 
-/// A video decoded in software: Ogg Theora (the engine's video layers) or MPEG-1 (the
-/// Windows builds' full-screen movies). Frames follow a clock in milliseconds and come out
+/// A video decoded in software: Ogg Theora (the engine's video layers), MPEG-1 (the
+/// Windows builds' full-screen movies) or MJA (motion JPEG effects, Ne no Kami). Frames follow a clock in milliseconds and come out
 /// as `CGImage`s for a layer or a presenter to show.
 public final class ArtemisVideo {
     private enum Decoder {
         case theora(OpaquePointer)
         case mpeg(OpaquePointer)
+        case mja(MJA)
+    }
+
+    /// `MJA0`, a 32-bit frame rate, then each frame as a 32-bit length and a JPEG.
+    private final class MJA {
+        let data: Data
+        let frames: [Range<Int>]
+        let frameRate: Double
+        var shown = -1
+
+        init?(data: Data) {
+            let bytes = [UInt8](data)
+            guard bytes.count > 12, bytes[0 ..< 4].elementsEqual("MJA0".utf8) else { return nil }
+            func u32(_ o: Int) -> Int { Int(bytes[o]) | Int(bytes[o + 1]) << 8 | Int(bytes[o + 2]) << 16 | Int(bytes[o + 3]) << 24 }
+            var frames: [Range<Int>] = []
+            var offset = 8
+            while offset + 4 <= bytes.count {
+                let length = u32(offset)
+                guard length > 0, offset + 4 + length <= bytes.count else { break }
+                frames.append(offset + 4 ..< offset + 4 + length)
+                offset += 4 + length
+            }
+            guard !frames.isEmpty else { return nil }
+            self.data = data
+            self.frames = frames
+            let rate = Double(u32(4))
+            frameRate = rate > 0 && rate <= 120 ? rate : 30
+        }
+
+        func image(_ index: Int) -> CGImage? {
+            let range = frames[index]
+            let jpeg = data.subdata(in: data.startIndex + range.lowerBound ..< data.startIndex + range.upperBound)
+            guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil) else { return nil }
+            return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+        }
     }
 
     public let width: Int
@@ -46,6 +82,8 @@ public final class ArtemisVideo {
             }
             guard let handle else { return nil }
             self.init(decoder: .theora(handle), audio: nil, memory: nil, loop: loop)
+        } else if ext == "mja", let movie = MJA(data: data) {
+            self.init(decoder: .mja(movie), audio: nil, memory: nil, loop: loop)
         } else if ext == "mpg" || ext == "mpeg" || ext == "m1v" {
             // pl_mpeg reads memory in place; keep one copy alive for both readers.
             let memory = UnsafeMutableRawPointer.allocate(byteCount: max(1, data.count), alignment: 16)
@@ -104,8 +142,17 @@ public final class ArtemisVideo {
                 audioSampleRate = 0
                 hasAudio = false
             }
+        case let .mja(movie):
+            let first = movie.image(0)
+            width = first?.width ?? 0
+            height = first?.height ?? 0
+            frameRate = movie.frameRate
+            hasAudio = false
+            audioSampleRate = 0
+            audioDecoder = nil
+            if let audio { plm_destroy(audio) }
         }
-        guard width > 0, height > 0, width % 2 == 0, height % 2 == 0 else {
+        guard width > 0, height > 0, width % 2 == 0 || isMJA(decoder), height % 2 == 0 || isMJA(decoder) else {
             Self.destroy(decoder)
             if let audioDecoder { plm_destroy(audioDecoder) }
             memory?.deallocate()
@@ -130,11 +177,18 @@ public final class ArtemisVideo {
         switch decoder {
         case let .theora(handle): shiori_theora_close(handle)
         case let .mpeg(handle): plm_destroy(handle)
+        case .mja: break
         }
+    }
+
+    private func isMJA(_ decoder: Decoder) -> Bool {
+        if case .mja = decoder { return true }
+        return false
     }
 
     public var duration: Double? {
         if case let .mpeg(handle) = decoder { return plm_get_duration(handle) * 1000 }
+        if case let .mja(movie) = decoder { return Double(movie.frames.count) * 1000 / movie.frameRate }
         return nil
     }
 
@@ -143,6 +197,22 @@ public final class ArtemisVideo {
     public func update(time: Double) -> Bool {
         guard !isFinished else { return false }
         if startTime == nil { startTime = time }
+        if case let .mja(movie) = decoder {
+            // Frames are whole JPEGs: show the one due now, skipping any in between.
+            var target = Int(((time - startTime!) * frameRate / 1000).rounded(.down))
+            if target >= movie.frames.count {
+                guard loop else {
+                    isFinished = true
+                    return false
+                }
+                startTime = time
+                target = 0
+            }
+            guard target != movie.shown, let frame = movie.image(target) else { return false }
+            movie.shown = target
+            image = frame
+            return true
+        }
         var target = Int(((time - startTime!) * frameRate / 1000).rounded(.down))
         // Far behind (the clock jumped: skip mode, a paused app): carry on from the next
         // frame instead of decoding everything in between.
@@ -207,6 +277,8 @@ public final class ArtemisVideo {
             return ShioriPlanes(y: frame.y.data, cb: frame.cb.data, cr: frame.cr.data,
                                 y_stride: Int32(frame.y.width), c_stride: Int32(frame.cb.width),
                                 width: Int32(frame.width), height: Int32(frame.height))
+        case .mja:
+            return nil
         }
     }
 

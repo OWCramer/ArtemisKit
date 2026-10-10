@@ -102,6 +102,37 @@ case "cat":
     guard arguments.count >= 3 else { print("cat needs a path"); exit(2) }
     guard let data = try fs.data(arguments[2]) else { print("no \(arguments[2])"); exit(1) }
     print(decodeScriptText(data))
+case "mjainfo":
+    // artemis-cli mjainfo <game> <path>: the structure of an MJA movie (in memory only).
+    guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("mjainfo needs a path"); exit(2) }
+    let bytes = [UInt8](data)
+    func u32(_ o: Int) -> Int { Int(bytes[o]) | Int(bytes[o+1]) << 8 | Int(bytes[o+2]) << 16 | Int(bytes[o+3]) << 24 }
+    print("size \(bytes.count), magic \(String(bytes: bytes[0..<4], encoding: .ascii) ?? "?"), u32s \((1..<8).map { u32($0 * 4) })")
+    var soi: [Int] = []
+    var i = 0
+    while i + 1 < bytes.count, soi.count < 12 { if bytes[i] == 0xFF, bytes[i+1] == 0xD8, i + 2 < bytes.count, bytes[i+2] == 0xFF { soi.append(i) }; i += 1 }
+    print("first JPEG starts: \(soi)")
+    for o in soi.prefix(6) where o >= 8 { print("  before \(o): \(bytes[(o-8)..<o].map { String(format: "%02x", $0) }.joined(separator: " "))") }
+    if let first = soi.first, let image = CGImageSourceCreateWithData(Data(bytes[first...]) as CFData, nil).flatMap({ CGImageSourceCreateImageAtIndex($0, 0, nil) }) {
+        print("first frame \(image.width)x\(image.height) alpha \(image.alphaInfo.rawValue)")
+    }
+    // Colour (saturation) and brightness of each half of the first frames: grey halves are alpha.
+    for (n, o) in soi.prefix(4).enumerated() {
+        guard let image = CGImageSourceCreateWithData(Data(bytes[o...]) as CFData, nil).flatMap({ CGImageSourceCreateImageAtIndex($0, 0, nil) }) else { continue }
+        let w = image.width, h = image.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        func stats(_ rows: Range<Int>, _ cols: Range<Int>) -> String {
+            var sat = 0.0, lum = 0.0, n = 0.0
+            for y in stride(from: rows.lowerBound, to: rows.upperBound, by: 3) { for x in stride(from: cols.lowerBound, to: cols.upperBound, by: 3) {
+                let i = (y * w + x) * 4; let r = Double(px[i]), g = Double(px[i+1]), b = Double(px[i+2])
+                sat += max(r, g, b) - min(r, g, b); lum += (r + g + b) / 3; n += 1 } }
+            return String(format: "sat %.1f lum %.1f", sat / n, lum / n)
+        }
+        print("frame \(n): top [\(stats(0..<h/2, 0..<w))] bottom [\(stats(h/2..<h, 0..<w))] left [\(stats(0..<h, 0..<w/2))] right [\(stats(0..<h, w/2..<w))]")
+    }
 case "hex":
     // artemis-cli hex <game> <path> [bytes]: the start of one file in hex (in memory only).
     guard arguments.count >= 3, let data = try fs.data(arguments[2]) else { print("hex needs a path"); exit(2) }
@@ -282,6 +313,12 @@ case "snapshot":
                     autoreleasepool { player.update(time: time) }
                 case .stop, .click:
                     autoreleasepool { player.update(time: time + 5000) }
+                    // ARTEMIS_CHECK80=1: waits where layer 80 is hidden but text would still show.
+                    if ProcessInfo.processInfo.environment["ARTEMIS_CHECK80"] != nil, player.stage.layer("80")?.visible == false {
+                        let showing = player.messages.layers.filter { !$0.value.layered && $0.value.visible && !$0.value.pageHidden
+                            && $0.value.alpha > 0 && !$0.value.text.trimmingCharacters(in: .whitespaces).isEmpty && !$0.key.hasPrefix("basefont") }
+                        if !showing.isEmpty { print("check80: \(showing.keys.sorted()) at \(player.interpreter.location) hidden=\(player.hidden)") }
+                    }
                     time += 5000
                     // The update may have moved on by itself (skip, auto, timers).
                     if player.wait != .stop, player.wait != .click { continue }

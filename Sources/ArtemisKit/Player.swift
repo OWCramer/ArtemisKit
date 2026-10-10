@@ -929,8 +929,11 @@ public final class ArtemisPlayer: ArtemisHost {
     }
     private var textImages: [String: (revision: Int, scale: Double, image: CGImage)] = [:]
 
-    /// Text that isn't layered shows only while its window does (the message layers' parent, 80).
-    public var messageTextVisible: Bool { stage.layer("80").map(\.visible) ?? true }
+    /// Text that isn't layered shows unless the reader hid it (`[hide]`, Shiori's hide). Games
+    /// hide it themselves through each message layer ([sceout], `visible`, alpha), which the
+    /// text renderer follows; full runs of Ne no Kami and Memory's Dogma never show text
+    /// with their window hidden.
+    public var messageTextVisible: Bool { !hidden }
 
     /// A pixel shader `lyshader` names, as Metal. Windows builds load HLSL (`system/shader/pc`)
     /// or compiled shaders; the same effects ship as GLSL ES for the mobile and Switch builds
