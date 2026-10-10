@@ -1293,6 +1293,8 @@ public final class ArtemisPlayer: ArtemisHost {
         "uidel", "avoid", "statusbar",
         "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
+        // The newer generation loads its pixel shaders by name; `lyprop shader=` applies them.
+        "lyshader",
     ]
 
     // MARK: Click-wait glyph

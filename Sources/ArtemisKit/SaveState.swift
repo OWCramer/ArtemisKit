@@ -24,6 +24,9 @@ struct ArtemisSaveState: Codable {
         /// A video layer's file and looping (it restarts on load).
         var video: String?
         var videoLoops: Bool?
+        /// `lyprop shader=` (the newer generation's tints and blurs).
+        var shader: String?
+        var shaderValues: [String: String]?
     }
 
     struct Message: Codable {
@@ -65,7 +68,8 @@ extension ArtemisStage {
                                 left: layer.left, top: layer.top, alpha: layer.alpha, xscale: layer.xscale, yscale: layer.yscale,
                                 rotate: layer.rotate, anchorX: layer.anchorX, anchorY: layer.anchorY, visible: layer.visible,
                                 messageLayer: layer.messageLayer,
-                                video: layer.video == nil ? nil : layer.file, videoLoops: layer.video?.loop))
+                                video: layer.video == nil ? nil : layer.file, videoLoops: layer.video?.loop,
+                                shader: layer.shader?.name, shaderValues: layer.shader?.values))
             layer.children.forEach(visit)
         }
         root.children.forEach(visit)
@@ -91,7 +95,9 @@ extension ArtemisStage {
             layer.rotate = saved.rotate; layer.anchorX = saved.anchorX; layer.anchorY = saved.anchorY
             layer.visible = saved.visible
             layer.messageLayer = saved.messageLayer
+            layer.shader = saved.shader.map { ArtemisShader(name: $0, values: saved.shaderValues ?? [:]) }
         }
+        markShadersChanged()
         restoreEvents(events)
     }
 }

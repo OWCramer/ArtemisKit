@@ -107,7 +107,10 @@ public final class ArtemisInterpreter {
     nonisolated(unsafe) private var lua: OpaquePointer?
     nonisolated(unsafe) private var luaHost = ArtemisLuaHost()
     private var reportedUnhandled: Set<String> = []
-    private var inTagFilter = false
+    /// Tags the game's tag filter is handling now. The older games' filters never see tags they
+    /// issue themselves; the newer generation's (its Lua `tags` table) see any but their own
+    /// (`tags.system_info` issues [autoplay], which `tags.autoplay` handles).
+    private var filteringTags: Set<String> = []
     /// Commands run, for runaway-loop protection in headless runs.
     public private(set) var steps = 0
 
@@ -259,9 +262,9 @@ public final class ArtemisInterpreter {
     /// Runs the game's `e:setTagFilter` function for this tag, if any. True when the filter
     /// handled the tag and it shouldn't run. Tags the filter issues itself aren't filtered.
     func filterTag(_ tag: ArtemisTag) throws -> Bool {
-        guard let lua, !inTagFilter else { return false }
-        inTagFilter = true
-        defer { inTagFilter = false }
+        guard let lua, defersLuaCalls ? !filteringTags.contains(tag.name) : filteringTags.isEmpty else { return false }
+        filteringTags.insert(tag.name)
+        defer { filteringTags.remove(tag.name) }
         let encoding = fileSystem.encoding
         // A trailing nil keeps the buffers non-empty for tags without parameters.
         var keys: [UnsafeMutablePointer<CChar>?] = tag.order.map { strdup(luaBytes($0, encoding)) } + [nil]
@@ -1102,6 +1105,8 @@ public final class ArtemisInterpreter {
         }
         if Self.traceLua { host?.log("trace: \(String(repeating: "  ", count: luaDepth))e:tag \(tag.name) \(order.map { "\($0)=\(attributes[$0] ?? "")" }.joined(separator: " "))") }
         do {
+            // The newer generation's e:tag goes through its tag filter too.
+            if defersLuaCalls, try filterTag(tag) { return }
             if tag.name == "call", defersLuaCalls, luaDepth > 0 {
                 deferredLuaCalls.append((tag["file"], tag["label"]))
             } else if tag.name == "call" {

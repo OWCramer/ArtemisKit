@@ -47,6 +47,11 @@ public final class ArtemisLayer {
     public var grayscale = false
     public var colorMultiply: UInt32 = 0xFFFFFF
     public var mask: CGImage?
+    /// `lyprop shader=` (the newer generation's pixel shaders, done with Core Image), and
+    /// the shaders of the layers it sits in (a character's time-of-day tint is set on its
+    /// "tone" parent, a blur on a "blurx"/"blury" one).
+    public var shader: ArtemisShader?
+    public internal(set) var inheritedShaders: [ArtemisShader] = []
     /// `clickablethreshold`: events fire only where the image's alpha reaches this.
     public var clickThreshold: Double?
     /// `draggable` / `dragarea` (left, top, right, bottom the layer stays within).
@@ -56,10 +61,12 @@ public final class ArtemisLayer {
     /// The image as shown: mask and colour effects applied (cached).
     public var displayImage: CGImage? {
         guard let image else { return nil }
-        guard negative || grayscale || colorMultiply != 0xFFFFFF || mask != nil else { return image }
-        let key = "\(ObjectIdentifier(image))|\(negative)|\(grayscale)|\(colorMultiply)|\(mask.map { "\(ObjectIdentifier($0))" } ?? "-")"
+        let shaders = (shader.map { [$0] } ?? []) + inheritedShaders
+        guard negative || grayscale || colorMultiply != 0xFFFFFF || mask != nil || !shaders.isEmpty else { return image }
+        let key = "\(ObjectIdentifier(image))|\(negative)|\(grayscale)|\(colorMultiply)|\(mask.map { "\(ObjectIdentifier($0))" } ?? "-")|"
+            + shaders.map(\.key).joined(separator: ";")
         if key == processedKey, let processed { return processed }
-        processed = ArtemisLayer.process(image, negative: negative, grayscale: grayscale, multiply: colorMultiply, mask: mask)
+        processed = ArtemisLayer.process(image, negative: negative, grayscale: grayscale, multiply: colorMultiply, mask: mask, shaders: shaders)
         processedKey = key
         return processed
     }
@@ -68,7 +75,8 @@ public final class ArtemisLayer {
 
     private static let ciContext = CIContext(options: [.cacheIntermediates: false])
 
-    static func process(_ image: CGImage, negative: Bool, grayscale: Bool, multiply: UInt32, mask: CGImage?) -> CGImage? {
+    static func process(_ image: CGImage, negative: Bool, grayscale: Bool, multiply: UInt32, mask: CGImage?,
+                        shaders: [ArtemisShader] = []) -> CGImage? {
         var output = CIImage(cgImage: image)
         let extent = output.extent
         if grayscale {
@@ -84,6 +92,7 @@ public final class ArtemisLayer {
                 "inputBVector": CIVector(x: 0, y: 0, z: b, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
             ])
         }
+        for shader in shaders { output = shader.apply(to: output, extent: extent) }
         if let mask {
             // White in the mask is opaque, black transparent.
             let maskImage = CIImage(cgImage: mask).transformed(by: CGAffineTransform(scaleX: extent.width / CGFloat(mask.width),
@@ -436,6 +445,7 @@ public final class ArtemisStage {
         layer.image = nil; layer.color = nil; layer.file = nil; layer.video = nil
         layer.reverseX = false; layer.reverseY = false; layer.clip = nil; layer.blendMode = "normal"
         layer.negative = false; layer.grayscale = false; layer.colorMultiply = 0xFFFFFF; layer.mask = nil
+        layer.shader = nil
         layer.clickThreshold = nil; layer.draggable = false; layer.dragArea = nil; layer.anime = nil
         if let mask = tag["mask"], !mask.isEmpty { layer.mask = image(mask) }
         tweens.removeAll { $0.layer == id }
@@ -514,6 +524,14 @@ public final class ArtemisStage {
         if let value = tag["negative"] { layer.negative = value == "1" }
         if let value = tag["grayscale"] { layer.grayscale = value == "1" }
         if let value = tag["colormultiply"] { layer.colorMultiply = ArtemisMessages.rgb(value) & 0xFFFFFF }
+        if let name = tag["shader"] {
+            // `shaderconstant` names the parameters the shader gets, each in its own attribute.
+            let names = (tag["shaderconstant"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            var values: [String: String] = [:]
+            for key in names { values[key] = tag[key] }
+            layer.shader = name.isEmpty || name == "reset" ? nil : ArtemisShader(name: name, values: values)
+            shadersChanged = true
+        }
         if let value = tag["clickablethreshold"] { layer.clickThreshold = ArtemisValue.number(from: value) }
         if let value = tag["draggable"] { layer.draggable = value == "1" }
         if let area = numbers("dragarea") { layer.dragArea = area.count == 4 ? CGRect(x: area[0], y: area[1], width: area[2] - area[0], height: area[3] - area[1]) : nil }
@@ -615,7 +633,29 @@ public final class ArtemisStage {
     public private(set) var tweenRevision = 0
 
     /// Advances tweens to `time` (ms). Finished ones land on their end value.
+    /// A shader was set or cleared since the last update; `shadersActive`: some layer has one.
+    private var shadersChanged = false
+    private var shadersActive = false
+    func markShadersChanged() { shadersChanged = true }
+
+    /// Hands each layer the shaders of the layers it sits in, nearest first. Walks the tree
+    /// only while any shader is set (layers come and go under a tinted parent every scene).
+    private func propagateShaders() {
+        guard shadersChanged || shadersActive else { return }
+        shadersChanged = false
+        var active = false
+        func visit(_ layer: ArtemisLayer, _ inherited: [ArtemisShader]) {
+            if layer.inheritedShaders != inherited { layer.inheritedShaders = inherited }
+            let own = layer.shader.map { [$0] + inherited } ?? inherited
+            if layer.shader != nil { active = true }
+            for child in layer.children { visit(child, own) }
+        }
+        visit(root, [])
+        shadersActive = active
+    }
+
     public func update(time: Double) {
+        propagateShaders()
         clock = time
         for id in videoLayers where !holdsVideoFrames {
             guard let layer = layer(id), let video = layer.video else {
