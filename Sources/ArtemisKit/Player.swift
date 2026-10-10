@@ -439,6 +439,27 @@ public final class ArtemisPlayer: ArtemisHost {
         }
     }
 
+    /// The pointer over a stage point with no button down (a trackpad or mouse): moves the
+    /// mouse position Lua frameworks poll (`e:getMousePoint`, NUKITASHI's button highlights)
+    /// and, at a [stop], rolls the layer under it over and the one it left out, as the
+    /// engine does on PC.
+    public func hover(at point: CGPoint) {
+        interpreter.pointer = point
+        guard wait == .stop else { return }
+        let over = stage.eventTarget(at: point, type: "rollover") ?? stage.eventTarget(at: point, type: "rollout")
+        guard over != hoveredLayer else { return }
+        let left = hoveredLayer
+        hoveredLayer = over
+        if let left, let event = stage.events[left]?["rollout"], event.enabled {
+            wait = .none
+            fire(event.attributes, interrupt: false)
+        }
+        if wait == .stop, let over, let event = stage.events[over]?["rollover"], event.enabled {
+            wait = .none
+            fire(event.attributes, interrupt: false)
+        }
+    }
+
     /// A newer-generation button press. A finger has no hover, so the button under it is
     /// rolled over first, as the mouse would have; then its click; then the left button's own
     /// handler (key 1), which acts on the click the button noted: NUKITASHI's framework
