@@ -258,6 +258,7 @@ case "snapshot":
         do {
             let player = try ArtemisPlayer(gameRoot: game, patchRoot: patch)
             if let saves = ProcessInfo.processInfo.environment["ARTEMIS_SAVES"] { player.savePath = URL(fileURLWithPath: saves) }
+            player.traceWaits = ProcessInfo.processInfo.environment["ARTEMIS_TRACE_WAITS"] != nil
             player.onLog = { message in
                 if ProcessInfo.processInfo.environment["ARTEMIS_LUALOG"] != nil || (!message.hasPrefix("debug:") && !message.hasPrefix("lua:")) { print("· \(message)") }
             }

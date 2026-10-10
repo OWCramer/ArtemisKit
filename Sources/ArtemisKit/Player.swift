@@ -414,7 +414,14 @@ public final class ArtemisPlayer: ArtemisHost {
         switch wait {
         case .stop:
             let point = touchPoint(near: point)
-            guard let (_, event) = stage.clickTarget(at: point) else { return }
+            guard let (_, event) = stage.clickTarget(at: point) else {
+                // A click on nothing: the script's own key-1 handler (Ne no Kami's hide screen
+                // comes back with [setonpush key="1"]), or out of the right-click script, whose
+                // hide mode leaves nothing on screen to tap.
+                if press(key: "1") { return }
+                if interpreter.inRightClickScript { rightClick() }
+                return
+            }
             wait = .none
             fire(event.attributes, interrupt: false)
         case .click, .time, .sound, .videoLayer:
@@ -575,7 +582,10 @@ public final class ArtemisPlayer: ArtemisHost {
         // A key handler on the right button (key 2) takes precedence, e.g. menus bind it to
         // their *leave.
         if press(key: "2") { return }
-        guard rightClickAllowed else { return }
+        // `[rclick allow=0]` stops the right-click script from opening, not from closing:
+        // Ne no Kami's hides the text with a macro that turns it off, then waits for the
+        // right-click that ends it.
+        guard rightClickAllowed || interpreter.inRightClickScript else { return }
         switch wait {
         case .click, .stop:
             if !interpreter.inRightClickScript { savedWaits.append(wait) }
