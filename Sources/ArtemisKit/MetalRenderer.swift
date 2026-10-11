@@ -24,6 +24,9 @@ public final class ArtemisMetalRenderer {
     private var transitionPipeline: MTLRenderPipelineState?
     private let linear: MTLSamplerState
     private let nearest: MTLSamplerState
+    /// The game's own shaders: their HLSL twins declare `AddressU = Clamp; AddressV = Clamp;`
+    /// on every sampler, so a raster wave pulls in the edge column rather than black.
+    private let edge: MTLSamplerState
     private let clearTexture: MTLTexture
     private let whiteTexture: MTLTexture
 
@@ -41,13 +44,13 @@ public final class ArtemisMetalRenderer {
         self.device = device
         self.queue = queue
         self.library = library
-        func sampler(_ filter: MTLSamplerMinMagFilter) -> MTLSamplerState? {
+        func sampler(_ filter: MTLSamplerMinMagFilter, address: MTLSamplerAddressMode = .clampToZero) -> MTLSamplerState? {
             let descriptor = MTLSamplerDescriptor()
             descriptor.minFilter = filter
             descriptor.magFilter = filter
             // Past a picture's edge is transparent (a clip wider than its picture).
-            descriptor.sAddressMode = .clampToZero
-            descriptor.tAddressMode = .clampToZero
+            descriptor.sAddressMode = address
+            descriptor.tAddressMode = address
             return device.makeSamplerState(descriptor: descriptor)
         }
         func pixel(_ value: UInt8) -> MTLTexture? {
@@ -57,10 +60,11 @@ public final class ArtemisMetalRenderer {
             texture.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &bytes, bytesPerRow: 4)
             return texture
         }
-        guard let linear = sampler(.linear), let nearest = sampler(.nearest),
+        guard let linear = sampler(.linear), let nearest = sampler(.nearest), let edge = sampler(.linear, address: .clampToEdge),
               let clear = pixel(0), let white = pixel(255) else { return nil }
         self.linear = linear
         self.nearest = nearest
+        self.edge = edge
         clearTexture = clear
         whiteTexture = white
     }
@@ -506,7 +510,7 @@ public final class ArtemisMetalRenderer {
                 }
                 encoder.setFragmentTexture(texture ?? clearTexture, index: slot)
             }
-            encoder.setFragmentSamplerState(linear, index: 0)
+            encoder.setFragmentSamplerState(edge, index: 0)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             return
         }

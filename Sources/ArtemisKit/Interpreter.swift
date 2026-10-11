@@ -408,6 +408,13 @@ public final class ArtemisInterpreter {
         }
     }
 
+    /// Runs Lua as if the game's own code called it (`artemis-cli snapshot`'s ARTEMIS_LUA):
+    /// what it queues takes effect once it returns, as with any Lua call.
+    public func evaluateLua(_ source: String) throws {
+        try runLua(Data("function artemis_evaluate()\n\(source)\nend".utf8), chunk: "evaluate")
+        try callLua(ArtemisTag(name: "calllua", attributes: ["function": "artemis_evaluate"], order: ["function"]))
+    }
+
     /// Read-only system variables the engine provides (`s.current_message_layer`, ...).
     public var systemVariable: ((String) -> String?)?
 

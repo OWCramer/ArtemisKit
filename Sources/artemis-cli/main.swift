@@ -354,6 +354,16 @@ case "snapshot":
                 }
                 if player.failure != nil { break loop }
             }
+            // ARTEMIS_LUA=<code>: runs the game's Lua there (an effect no scene uses), then
+            // ARTEMIS_FRAMES frames (default 60) so its onEnterFrame work happens.
+            if let lua = ProcessInfo.processInfo.environment["ARTEMIS_LUA"] {
+                do { try player.interpreter.evaluateLua(lua) } catch { print("lua: \(error)") }
+                let frames = ProcessInfo.processInfo.environment["ARTEMIS_FRAMES"].flatMap(Int.init) ?? 60
+                for _ in 0 ..< frames {
+                    time += 16
+                    autoreleasepool { player.update(time: time) }
+                }
+            }
             print("stopped: \(player.wait) at \(player.interpreter.location), t=\(Int(time)) ms, script \(player.interpreter.state)")
             if let failure = player.failure { print("FAILED: \(failure)") }
             print("message layer: \(player.messages.current)")
