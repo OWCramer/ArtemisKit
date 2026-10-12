@@ -439,6 +439,43 @@ public final class ArtemisPlayer: ArtemisHost {
         }
     }
 
+    /// A click on nothing (Enter, Space, a controller's A with no button picked): reads on,
+    /// finishes a wait, brings hidden text back, or runs the game's own key-1 handler at a
+    /// [stop], as a tap on an empty part of the stage does.
+    public func decide() {
+        tap(at: emptyPoint())
+    }
+
+    /// A stage point with no button, link or rollover under it (the bottom middle first,
+    /// where the text is).
+    private func emptyPoint() -> CGPoint {
+        let w = stage.width, h = stage.height
+        for fy in [0.85, 0.95, 0.75, 0.5, 0.25, 0.05] {
+            for fx in [0.5, 0.3, 0.7, 0.1, 0.9] {
+                let point = CGPoint(x: w * fx, y: h * fy)
+                if stage.clickTarget(at: point) == nil, linkTarget(at: point) == nil,
+                   stage.eventTarget(at: point, type: "rollover") == nil {
+                    return point
+                }
+            }
+        }
+        return CGPoint(x: w / 2, y: h * 0.85)
+    }
+
+    /// The buttons and text links a player can press now (stage pixels): at a [stop], every
+    /// button; while text waits, the on-screen ones (MENU, quick save, ...).
+    public func focusTargets() -> [CGRect] {
+        guard wait == .stop || wait == .click else { return [] }
+        var frames = stage.eventFrames(types: wait == .stop ? ["click", "rollover"] : ["click"])
+        for layer in messages.layers.values where layer.visible && !layer.pageHidden && !layer.links.isEmpty {
+            frames += textRenderer.linkRects(layer).map(\.1)
+        }
+        let bounds = CGRect(x: 0, y: 0, width: stage.width, height: stage.height)
+        // Not the screen-sized catch-alls some screens lay under their buttons.
+        return frames.filter { $0.width >= 8 && $0.height >= 8 && bounds.intersects($0)
+            && $0.width * $0.height < bounds.width * bounds.height * 0.6 }
+    }
+
     /// The pointer over a stage point with no button down (a trackpad or mouse): moves the
     /// mouse position Lua frameworks poll (`e:getMousePoint`, NUKITASHI's button highlights)
     /// and, at a [stop], rolls the layer under it over and the one it left out, as the

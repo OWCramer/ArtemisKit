@@ -947,6 +947,23 @@ public final class ArtemisStage {
         tweenRevision += 1
     }
 
+    /// Where the visible layers with an enabled event of one of `types` are (stage pixels),
+    /// for moving a keyboard or controller focus between buttons.
+    public func eventFrames(types: Set<String>) -> [CGRect] {
+        var result: [CGRect] = []
+        func visit(_ layer: ArtemisLayer, _ transform: CGAffineTransform) {
+            guard layer.visible else { return }
+            let combined = layer.transform.concatenating(transform)
+            if layer.width > 0, layer.height > 0,
+               events[layer.id]?.contains(where: { types.contains($0.key) && $0.value.enabled }) == true {
+                result.append(CGRect(x: 0, y: 0, width: layer.width, height: layer.height).applying(combined))
+            }
+            for child in layer.children { visit(child, combined) }
+        }
+        for child in root.children { visit(child, .identity) }
+        return result
+    }
+
     /// The topmost visible layer with an enabled click event under `point` (stage pixels).
     public func clickTarget(at point: CGPoint) -> (layer: String, event: ArtemisLayerEvent)? {
         var result: (String, ArtemisLayerEvent)?
