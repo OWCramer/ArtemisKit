@@ -1242,6 +1242,11 @@ public final class ArtemisPlayer: ArtemisHost {
             } else {
                 save(to: "save.dat")
             }
+        case "autosave":
+            // The game's word on whether its place may be kept for later (on in the story,
+            // off on the title, in menus and scene replays): the engine's own autosave on
+            // suspend follows it, and so does Shiori's resume save.
+            if let allow = tag["allow"] { autosaveAllowed = allow != "0" }
         case "load":
             if load(from: tag["file"] ?? "save.dat", transition: tag) {
                 if wait == .none, interpreter.defersLuaCalls { return .done }
@@ -1419,7 +1424,7 @@ public final class ArtemisPlayer: ArtemisHost {
     /// uidel, avoid, statusbar), line breaking CoreText already does (prohibit, wordparts,
     /// indentmodify), and the window caption; plus common game macros' names.
     static let acceptedSilently: Set<String> = [
-        "caption", "autosave", "keyconfig", "mouse", "prohibit", "wordparts", "indentmodify", "ime", "slider",
+        "caption", "keyconfig", "mouse", "prohibit", "wordparts", "indentmodify", "ime", "slider",
         "uidel", "avoid", "statusbar", "setonwindowbutton", "delonwindowbutton",
         "btn_off", "info_hide_on", "info_hide_off",
         "lyevent_delete", "gesture_enable", "gesture_disable", "key_enable", "key_disable",
@@ -1724,7 +1729,8 @@ public final class ArtemisPlayer: ArtemisHost {
             rightClickFile: rightClickFile, rightClickAllowed: rightClickAllowed, hideWindows: hideWindows, music: music)
     }
 
-    private func save(to file: String) {
+    @discardableResult
+    private func save(to file: String) -> Bool {
         interpreter.callLuaEvent("onSave")
         let state = checkpoint ?? captureState(wait: savedWaits.first ?? wait)
         let url = resolveSavePath(file)
@@ -1733,9 +1739,57 @@ public final class ArtemisPlayer: ArtemisHost {
             try JSONEncoder().encode(state).write(to: url, options: .atomic)
             writeGlobals()
             record("saved \(url.lastPathComponent)")
+            return true
         } catch {
             record("save failed: \(error)")
+            return false
         }
+    }
+
+    // MARK: Resume save
+
+    /// `[autosave allow=]`: whether the game lets its place be kept right now.
+    public private(set) var autosaveAllowed = true
+
+    /// Whether this game's place can be kept outside its own save routine: the older
+    /// generation's. The newer one (Lua, `.asb`) keeps the story's place in Lua tables that
+    /// only its own save routine prepares, and redraws the story through its own load
+    /// routine, so a state captured from outside them loads to a blank screen.
+    public var supportsResume: Bool { !interpreter.defersLuaCalls }
+
+    /// Whether the reading position can be kept for later now: the story is waiting for a
+    /// click (or a menu or button routine is open over one, whose reading position `[save]`
+    /// keeps), the game allows its autosave there, and nothing has failed. Not on the
+    /// title, in a transition, a movie or a timed wait.
+    public var canSaveResume: Bool {
+        guard supportsResume, failure == nil, autosaveAllowed else { return false }
+        if checkpoint != nil { return savedWaits.first == .click }
+        return wait == .click
+    }
+
+    /// Keeps the reading position in `file` (the save format `[save]` writes, and the `g.`
+    /// variables), for Shiori to offer when the game next starts. Returns whether it saved.
+    @discardableResult
+    public func saveResume(to file: String) -> Bool {
+        guard canSaveResume else { return false }
+        return save(to: file)
+    }
+
+    /// Whether `resume(from:)` can take over now: the game has settled on a screen waiting
+    /// for a click or its buttons (its title), not in the middle of starting up.
+    public var canResume: Bool {
+        supportsResume && failure == nil && checkpoint == nil && (wait == .stop || wait == .click)
+    }
+
+    /// Loads a save made by `saveResume(to:)` as the game's own `[load]` would, fading in.
+    /// Returns whether it loaded.
+    @discardableResult
+    public func resume(from file: String) -> Bool {
+        guard canResume else { return false }
+        let fade = ArtemisTag(name: "load", attributes: ["type": "1", "time": "500"], order: ["type", "time"])
+        guard load(from: file, transition: fade) else { return false }
+        if wait == .none { runInterpreter() }
+        return true
     }
 
     /// Restores a save. Returns whether it worked (the script then waits where the save was).
