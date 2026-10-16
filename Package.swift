@@ -18,19 +18,19 @@ let package = Package(
         .target(
             name: "CVideo",
             exclude: ["README.md", "ogg/COPYING", "theora/COPYING"],
-            cSettings: [.headerSearchPath("theora"), .unsafeFlags(["-w"])]
+            cSettings: [.headerSearchPath("theora")]
         ),
         // Ogg Vorbis decoding (stb_vorbis); see Sources/CVorbis/README.md.
         .target(
             name: "CVorbis",
             exclude: ["README.md"],
-            cSettings: [.unsafeFlags(["-w"])]
+            cSettings: []
         ),
         // Lua 5.1.5 and Shiori's bridge for the engine's `e` object; see Sources/CLua/README.md.
         .target(
             name: "CLua",
             exclude: ["README.md", "COPYRIGHT"],
-            cSettings: [.unsafeFlags(["-Wno-deprecated-declarations", "-Wno-shorten-64-to-32"])]
+            cSettings: []
         ),
         // Developer tool: lists, extracts and inventories a game's archives from the Mac.
         .executableTarget(name: "artemis-cli", dependencies: ["ArtemisKit"]),
