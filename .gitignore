@@ -6,3 +6,7 @@ Vendor/
 build/
 DerivedData/
 xcuserdata/
+
+# Local notes and tools, not published
+docs/
+Scripts/artemis-inventory.py

@@ -7,7 +7,6 @@ It plays games you own; no game content is included.
 - `Sources/ArtemisKit`: archives (pf6, pf8), scripts, the interpreter, renderer and player.
 - `Sources/CLua`, `CVorbis`, `CVideo`: vendored Lua 5.1.5, stb_vorbis, libogg, libtheora and pl_mpeg.
 - `artemis-cli`: lists, extracts and inventories a game's archives on the Mac.
-- `docs/`: notes on the engine and its tags.
 
 ```sh
 swift build
