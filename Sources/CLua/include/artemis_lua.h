@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at
+// https://mozilla.org/MPL/2.0/.
+
 // Shiori's bridge between Artemis scripts' Lua and the Swift interpreter: the engine
 // object `e` that Lua functions receive (`function f(e, param)`), file reads redirected
 // to the game's archives, and a few calls the Swift side makes into Lua.

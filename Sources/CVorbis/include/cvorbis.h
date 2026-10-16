@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at
+// https://mozilla.org/MPL/2.0/.
+
 // stb_vorbis v1.22 (public domain, https://nothings.org/stb_vorbis/), vendored for Artemis
 // games' Ogg Vorbis music, effects and voices, which iOS can't decode itself.
 #pragma once
